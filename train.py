@@ -213,60 +213,56 @@ def train_model(
                         'epoch': epoch,
                     })
 
-                # Perform evaluation at regular intervals
-                division_step = (n_train // (1 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in list(unet.named_parameters()) + list(text_encoder.named_parameters()):
-                            tag = tag.replace('/', '.')
-                            if value.grad is None:
-                                continue
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+                histograms = {}
+                for tag, value in list(unet.named_parameters()) + list(text_encoder.named_parameters()):
+                    tag = tag.replace('/', '.')
+                    if value.grad is None:
+                        continue
+                    if not (torch.isinf(value) | torch.isnan(value)).any():
+                        histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
+                    if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                        histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-                        val_loss = evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp)
-                        scheduler.step(val_loss)
-                        logging.info(f'Validation loss: {val_loss}')
+                val_loss = evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp)
+                scheduler.step(val_loss)
+                logging.info(f'Validation loss: {val_loss}')
 
-                        try:
-                            log_dict = {
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation loss': val_loss,
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms,
-                            }
+                try:
+                    log_dict = {
+                        'learning rate': optimizer.param_groups[0]['lr'],
+                        'validation loss': val_loss,
+                        'step': global_step,
+                        'epoch': epoch,
+                        **histograms,
+                    }
 
-                            # sample "spia": stesso prompt e stesso seed ad ogni eval,
-                            # così vedi visivamente il modello migliorare nel tempo
-                            if sample_prompt_ids is not None:
-                                unet.eval()
-                                text_encoder.eval()
-                                with torch.no_grad():
-                                    prompt_ids = sample_prompt_ids.to(device)
-                                    cond_mask_eval = torch.ones(1, device=device)
-                                    text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
-                                    pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
-                                    shape = (1, 3, images.shape[-2], images.shape[-1])
+                    # sample "spia": stesso prompt e stesso seed ad ogni eval,
+                    # così vedi visivamente il modello migliorare nel tempo
+                    if sample_prompt_ids is not None:
+                        unet.eval()
+                        text_encoder.eval()
+                        with torch.no_grad():
+                            prompt_ids = sample_prompt_ids.to(device)
+                            cond_mask_eval = torch.ones(1, device=device)
+                            text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
+                            pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
+                            shape = (1, 3, images.shape[-2], images.shape[-1])
 
-                                    sample = diffusion.sample(
-                                        unet, shape, text_hidden_eval, pad_mask_eval,
-                                        device=device, seed=global_step,
-                                    )
+                            sample = diffusion.sample(
+                                unet, shape, text_hidden_eval, pad_mask_eval,
+                                device=device, seed=global_step,
+                            )
 
-                                    from predict import tensor_to_image
-                                    pil_img = tensor_to_image(sample[0].cpu())
-                                    log_dict['sample'] = wandb.Image(pil_img)
+                            from predict import tensor_to_image
+                            pil_img = tensor_to_image(sample[0].cpu())
+                            log_dict['sample'] = wandb.Image(pil_img)
 
-                                unet.train()
-                                text_encoder.train()
+                        unet.train()
+                        text_encoder.train()
 
-                            experiment.log(log_dict)
-                        except:
-                            pass
+                    experiment.log(log_dict)
+                except:
+                    pass
 
         # Save model checkpoint at the end of each epoch if enabled
         if save_checkpoint and epoch % 2 == 0:
@@ -319,7 +315,7 @@ def get_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--rebuild_tokenizer", action="store_true")
-    p.add_argument("--amp", type=bool, default=False, help="")
+    p.add_argument("--amp", action='store_true', help="Only for Cuda")
 
     return p.parse_args()
 
@@ -329,7 +325,7 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     set_seed(args.seed)
-    device = torch.device('mps' if torch.mps.is_available() else 'cpu')
+    device = torch.device('mps' if torch.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
     # create a configuration file.json for training
@@ -348,11 +344,11 @@ if __name__ == '__main__':
 
     train_ds = AvatarDataset(
         args.images_dir, args.attribute_legend_path, args.image_attribute_path, tokenizer,
-        split_ids=train_ids, image_size=args.image_size,
+        split_ids=train_ids, image_size=args.image_size, cache_dir="cache_64"
     )
     val_ds = AvatarDataset(
         args.images_dir, args.attribute_legend_path, args.image_attribute_path, tokenizer,
-        split_ids=val_ids, image_size=args.image_size,
+        split_ids=val_ids, image_size=args.image_size, cache_dir="cache_64"
     )
 
     train_loader = DataLoader(

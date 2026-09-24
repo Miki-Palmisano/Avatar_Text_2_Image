@@ -163,6 +163,7 @@ class AvatarDataset(Dataset):
             subject_component: str = "gender",
             component_order: Optional[List[str]] = None,
             attribute_fn: Optional[Callable[[Dict[str, str]], str]] = None,
+            cache_dir: Optional[str] = None,
     ):
         """
             images_dir:             folder with avatar images, filenames "<id>.png" etc.
@@ -186,6 +187,7 @@ class AvatarDataset(Dataset):
         self.images_dir = images_dir
         self.image_size = image_size
         self.tokenizer = tokenizer
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
         legend = parse_attribute_legend(attribute_legend_path)
         self.metadata, self.id_to_path = parse_image_attributes(image_attribute_path, legend)
@@ -225,9 +227,15 @@ class AvatarDataset(Dataset):
 
     def __getitem__(self, idx):
         name = self.ids[idx]
-        img_path = self.images_dir +"/"+ self.id_to_path[name]   # e.g. images_dir / "0/cs...9966.jpg"
-        img = load_data(img_path)
-        img = self.preprocess(img, self.image_size)
+
+        cache_path = (self.cache_dir / f"{name}.npy") if self.cache_dir else None
+
+        if cache_path is not None and cache_path.exists():
+            img = np.load(cache_path).astype(np.float32)  # già preprocessato: resize+normalize fatti una volta sola
+        else:
+            img_path = self.images_dir +"/"+ self.id_to_path[name]   # e.g. images_dir / "0/cs...9966.jpg"
+            img = load_data(img_path)
+            img = self.preprocess(img, self.image_size)
 
         caption = self.captions[name]
         token_ids = self.tokenizer.encode(caption)
