@@ -3,3 +3,6 @@ Unet.png
 
 .idea/
 __pycache__/
+wandb/
+checkpoints/
+gen_img/

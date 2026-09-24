@@ -1,117 +1,172 @@
+"""
+
+python3 predict.py -m ./checkpoints/checkpoint_first_test_epoch2.pth -p "a boy with blue eye color, afro hair style" --seed 42 --guidance-scale 2.0 -v
+
+"""
+
 import argparse
 import logging
-import os
+from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
-from torchvision import transforms
 
-from utils.data_loading import BasicDataset
-from unet import UNet
-from utils.utils import plot_img_and_mask
+from unet.unet_model import UNet
+from text_encoder import TextEncoder
+from diffusion import GaussianDiffusion
+from tokenizer import Tokenizer
 
-def predict_img(net,
-                full_img,
-                device,
-                scale_factor=1,
-                out_threshold=0.5):
-    net.eval()
-    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, scale_factor, is_mask=False))
-    img = img.unsqueeze(0)
-    img = img.to(device=device, dtype=torch.float32)
 
-    with torch.no_grad():
-        output = net(img).cpu()
-        output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
-        if net.n_classes > 1:
-            mask = output.argmax(dim=1)
+@torch.no_grad()
+def sample_with_guidance(unet, diffusion, shape, text_hidden, text_pad_mask,
+                          null_hidden, null_pad_mask, device, guidance_scale=1.0,
+                          seed=None, clip_denoised=True):
+    if seed is not None:
+        torch.manual_seed(seed)
+    x = torch.randn(shape, device=device)
+
+    for t in reversed(range(diffusion.T)):
+        batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
+
+        if guidance_scale == 1.0:
+            pred_noise = unet(x, batch_t, text_hidden, text_pad_mask)
         else:
-            mask = torch.sigmoid(output) > out_threshold
+            eps_cond = unet(x, batch_t, text_hidden, text_pad_mask)
+            eps_uncond = unet(x, batch_t, null_hidden, null_pad_mask)
+            pred_noise = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
-    return mask[0].long().squeeze().numpy()
+        sqrt_ac_t = diffusion.sqrt_alphas_cumprod[t]
+        sqrt_omac_t = diffusion.sqrt_one_minus_alphas_cumprod[t]
+
+        if clip_denoised:
+            x0_pred = ((x - sqrt_omac_t * pred_noise) / sqrt_ac_t).clamp(-1, 1)
+            pred_noise = (x - sqrt_ac_t * x0_pred) / sqrt_omac_t
+
+        beta_t = diffusion.betas[t]
+        sqrt_recip_alpha_t = 1.0 / torch.sqrt(diffusion.alphas[t])
+        mean = sqrt_recip_alpha_t * (x - beta_t / sqrt_omac_t * pred_noise)
+
+        if t == 0:
+            x = mean
+        else:
+            noise = torch.randn_like(x)
+            std = torch.sqrt(diffusion.posterior_variance[t])
+            x = mean + std * noise
+
+    return x.clamp(-1, 1)
+
+
+def generate_image(unet, text_encoder, diffusion, tokenizer, prompt, device,
+                    image_size, guidance_scale=1.0, seed=None):
+    """Genera una singola immagine (B=1) a partire da un prompt testuale."""
+    unet.eval()
+    text_encoder.eval()
+
+    input_ids = torch.as_tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
+    pad_mask = input_ids.eq(tokenizer.pad_id)
+
+    cond_mask = torch.ones(1, device=device)          # 1 = usa il testo vero
+    uncond_mask = torch.zeros(1, device=device)        # 0 = forza l'embedding "null"
+
+    text_hidden, _ = text_encoder(input_ids, cond_mask)
+    null_hidden, _ = text_encoder(input_ids, uncond_mask)
+
+    shape = (1, 3, image_size, image_size)
+    sample = sample_with_guidance(
+        unet, diffusion, shape, text_hidden, pad_mask, null_hidden, pad_mask,
+        device=device, guidance_scale=guidance_scale, seed=seed,
+    )
+    return sample[0].cpu()  # (3, H, W) in [-1, 1]
+
+
+def tensor_to_image(img: torch.Tensor) -> Image.Image:
+    """[-1, 1] CHW -> PIL Image HWC uint8"""
+    img = (img + 1) / 2                      # -> [0, 1]
+    img = img.clamp(0, 1).mul(255).byte()
+    img = img.permute(1, 2, 0).numpy()        # CHW -> HWC
+    return Image.fromarray(img)
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description='Predict masks from input images')
-    parser.add_argument('--model', '-m', default='MODEL.pth', metavar='FILE',
-                        help='Specify the file in which the model is stored')
-    parser.add_argument('--input', '-i', metavar='INPUT', nargs='+', help='Filenames of input images', required=True)
-    parser.add_argument('--output', '-o', metavar='OUTPUT', nargs='+', help='Filenames of output images')
-    parser.add_argument('--viz', '-v', action='store_true',
-                        help='Visualize the images as they are processed')
-    parser.add_argument('--no-save', '-n', action='store_true', help='Do not save the output masks')
-    parser.add_argument('--mask-threshold', '-t', type=float, default=0.5,
-                        help='Minimum probability value to consider a mask pixel white')
-    parser.add_argument('--scale', '-s', type=float, default=0.5,
-                        help='Scale factor for the input images')
-    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
-    
+    parser = argparse.ArgumentParser(description='Generate avatar images from a text prompt')
+    parser.add_argument('--model', '-m', required=True, metavar='FILE',
+                         help='Path al checkpoint (.pt) salvato da train.py')
+    parser.add_argument('--prompt', '-p', required=True,
+                         help='Caption testuale, es: "a boy with blue eye color, short hair style"')
+    parser.add_argument('--output', '-o', default=None, metavar='OUTPUT',
+                         help='Nome file di output (default: derivato dal prompt)')
+    parser.add_argument('--tokenizer', default=None,
+                         help='Path al tokenizer.json; se omesso, prova a leggerlo dal checkpoint')
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--guidance-scale', type=float, default=1.0,
+                         help='Classifier-free guidance scale (1.0 = nessuna guidance extra)')
+    parser.add_argument('--viz', '-v', action='store_true', help='Mostra l\'immagine generata')
     return parser.parse_args()
-
-
-def get_output_filenames(args):
-    def _generate_name(fn):
-        return f'{os.path.splitext(fn)[0]}_OUT.png'
-
-    return args.output or list(map(_generate_name, args.input))
-
-
-def mask_to_image(mask: np.ndarray, mask_values):
-    if isinstance(mask_values[0], list):
-        out = np.zeros((mask.shape[-2], mask.shape[-1], len(mask_values[0])), dtype=np.uint8)
-    elif mask_values == [0, 1]:
-        out = np.zeros((mask.shape[-2], mask.shape[-1]), dtype=bool)
-    else:
-        out = np.zeros((mask.shape[-2], mask.shape[-1]), dtype=np.uint8)
-
-    if mask.ndim == 3:
-        mask = np.argmax(mask, axis=0)
-
-    for i, v in enumerate(mask_values):
-        out[mask == i] = v
-
-    return Image.fromarray(out)
 
 
 if __name__ == '__main__':
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-    in_files = args.input
-    out_files = get_output_filenames(args)
-
-    net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Loading model {args.model}')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
     logging.info(f'Using device {device}')
 
-    net.to(device=device)
-    state_dict = torch.load(args.model, map_location=device)
-    mask_values = state_dict.pop('mask_values', [0, 1])
-    net.load_state_dict(state_dict)
+    logging.info(f'Loading checkpoint {args.model}')
+    checkpoint = torch.load(args.model, map_location=device)
+    train_args = checkpoint.get('args', {})  # iperparametri salvati da train.py
+
+    # --- tokenizer: dal file esplicito, o da quello salvato nel checkpoint ---
+    if args.tokenizer:
+        tokenizer = Tokenizer.load(args.tokenizer)
+    elif 'tokenizer_vocab' in checkpoint:
+        tokenizer = Tokenizer()
+        tokenizer.token2id = checkpoint['tokenizer_vocab']
+        tokenizer.id2token = {v: k for k, v in tokenizer.token2id.items()}
+        tokenizer._fitted = True
+    else:
+        raise ValueError(
+            'Nessun tokenizer trovato: passa --tokenizer path/to/tokenizer.json '
+            'oppure usa un checkpoint che lo contiene già (tokenizer_vocab).'
+        )
+
+    image_size = train_args.get('image_size', 64)
+    text_dim = train_args.get('text_dim', 96)
+    base_ch = train_args.get('base_ch', 64)
+    timesteps = train_args.get('timesteps', 1000)
+    schedule = train_args.get('schedule', 'cosine')
+
+    unet = UNet(n_channels=3, base_ch=base_ch, text_dim=text_dim).to(device)
+    unet.load_state_dict(checkpoint['unet_state'])
+
+    print(unet.inc.double_conv[1].running_mean[:5])
+
+    text_encoder = TextEncoder(
+        vocab_size=tokenizer.vocab_size, dim=text_dim, pad_id=tokenizer.pad_id,
+    ).to(device)
+    text_encoder.load_state_dict(checkpoint['text_encoder_state'])
+
+    diffusion = GaussianDiffusion(timesteps=timesteps, schedule=schedule, device=device)
+
+    print("GENERATE diffusion:", diffusion.T, diffusion.betas[:5].tolist())
 
     logging.info('Model loaded!')
+    logging.info(f'Generating: "{args.prompt}"')
 
-    for i, filename in enumerate(in_files):
-        logging.info(f'Predicting image {filename} ...')
-        img = Image.open(filename)
+    image_tensor = generate_image(
+        unet, text_encoder, diffusion, tokenizer, args.prompt, device,
+        image_size=image_size, guidance_scale=args.guidance_scale, seed=args.seed,
+    )
+    result = tensor_to_image(image_tensor)
 
-        mask = predict_img(net=net,
-                           full_img=img,
-                           scale_factor=args.scale,
-                           out_threshold=args.mask_threshold,
-                           device=device)
+    out_path = args.output or f"{args.prompt[:40].strip().replace(' ', '_')}_OUT.png"
+    result.save("./gen_img/"+out_path)
+    logging.info(f'Image saved to {out_path}')
 
-        if not args.no_save:
-            out_filename = out_files[i]
-            result = mask_to_image(mask, mask_values)
-            result.save(out_filename)
-            logging.info(f'Mask saved to {out_filename}')
-
-        if args.viz:
-            logging.info(f'Visualizing results for image {filename}, close to continue...')
-            plot_img_and_mask(img, mask)
+    if args.viz:
+        result.show()
