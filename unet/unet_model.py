@@ -68,7 +68,7 @@ class UNet(nn.Module):
             x3 = self.mid_attn(x3, text_hidden, text_pad_mask)
 
             x = self.up1(x3, x2, t_emb)
-            x = self.up_attn(x, text_hidden, text_pad_mask)
+            #x = self.up_attn(x, text_hidden, text_pad_mask)
             x = self.up2(x, x1, t_emb)
 
         logits = self.outc(x)

@@ -1,6 +1,6 @@
 """
 
-python3 predict.py -m ./checkpoints/checkpoint_first_test_epoch80.pth -p "a boy with blue eye color, afro hair style" --seed 42 --guidance-scale 2.0 -v
+python3 predict.py -m ./checkpoints/checkpoint_Conditional_Run_1_2_epoch60.pth -p "a avatar with blue eye color and afro hair style" --seed 21 --guidance-scale 2.0 -v
 
 """
 
@@ -152,7 +152,6 @@ if __name__ == '__main__':
 
     diffusion = GaussianDiffusion(timesteps=timesteps, schedule=schedule, device=device)
 
-    print("GENERATE diffusion:", diffusion.T, diffusion.betas[:5].tolist())
 
     logging.info('Model loaded!')
     logging.info(f'Generating: "{args.prompt}"')

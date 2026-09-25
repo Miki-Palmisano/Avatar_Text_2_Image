@@ -1,5 +1,5 @@
 """
-Train script for U-Net segmentation model.
+Train script for the tiny text-conditioned avatar diffusion model.
 
 This module prepares datasets, initializes logging with WANDB, sets up training parameters,
 and handles model training, evaluation, and checkpoint saving.
@@ -38,11 +38,16 @@ os.environ["WANDB_MODE"] = "offline"
 
 dir_img = Path('./dataset/cartoonset100k')
 
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.mps.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+
 
 def load_split_ids(split_file: str, split_name: str):
     """split_file is the JSON saved during preprocessing, e.g.:
@@ -64,7 +69,7 @@ def build_tokenizer(args, train_ids):
     from utils.data_loading import parse_attribute_legend, parse_image_attributes, build_deterministic_caption
 
     legend = parse_attribute_legend(args.attribute_legend_path)
-    metadata = parse_image_attributes(args.image_attribute_path, legend)
+    metadata, _id_to_path = parse_image_attributes(args.image_attribute_path, legend)  # FIX: parse_image_attributes ritorna una TUPLA (metadata, id_to_path) — va spacchettata
     train_captions = [
         build_deterministic_caption(metadata[i]) for i in train_ids if i in metadata
     ]
@@ -76,23 +81,33 @@ def build_tokenizer(args, train_ids):
     logging.info(f"Built tokenizer: vocab_size={tok.vocab_size} from {len(train_captions)} train captions")
     return tok
 
-def timed_step(fn, *args, **kwargs):
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    result = fn(*args, **kwargs)
-    end.record()
-    torch.cuda.synchronize()
-    return result, start.elapsed_time(end)  # millisecondi
+
+def timed_step(fn, device, *args, **kwargs):
+    """Misura il tempo di una singola operazione: torch.cuda.Event su CUDA
+    (accurato), fallback su time.time() per MPS/CPU (meno preciso ma non crasha)."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = fn(*args, **kwargs)
+        end.record()
+        torch.cuda.synchronize()
+        return result, start.elapsed_time(end)
+    else:
+        import time
+        t0 = time.time()
+        result = fn(*args, **kwargs)
+        return result, (time.time() - t0) * 1000  # ms
+
 
 def train_model(
         train_loader,
         val_loader,
-        model,
+        unet,
         text_encoder,
-        diffusion,  # GaussianDiffusion, già istanziata fuori (con i suoi timesteps/schedule)
-        tokenizer,  # per pad_id e per salvare il vocab nel checkpoint
+        diffusion,           # GaussianDiffusion, già istanziata fuori
+        tokenizer,            # per pad_id e per salvare il vocab nel checkpoint
         device,
         run_name: str = "run",
         dir_checkpoint: Path = Path("checkpoints"),
@@ -100,44 +115,52 @@ def train_model(
         batch_size: int = 128,
         learning_rate: float = 2e-4,
         save_checkpoint: bool = True,
+        save_every: int = 2,
         amp: bool = False,
         weight_decay: float = 1e-4,
         gradient_clipping: float = 1.0,
-        uncond_prob: float = 0.1,  # 1.0 = baseline unconditional, es. 0.1 = modello conditioned
+        uncond_prob: float = 0.1,     # 1.0 = baseline unconditional, es. 0.1 = modello conditioned
         sample_prompt_ids: torch.Tensor = None,  # (1, T) token ids per il sample "spia" ad ogni eval
+        load_path: str = None,        # checkpoint da cui caricare i pesi (None = training da zero)
+        resume: bool = False,         # se True, riprende anche optimizer/scheduler/epoca (richiede load_path)
+        profile: bool = False,        # se True, misura data/forward/backward/optimizer una tantum prima del training
 ):
     """
-    Train the U-Net model using specified parameters.
+    Train U-Net + text encoder con l'obiettivo DDPM (MSE sul rumore predetto).
 
-    Parameters:
-        model (nn.Module): The neural network to train.
-        device (torch.device): Device on which to run training.
-        epochs (int): Number of training epochs.
-        batch_size (int): Batch size for training.
-        learning_rate (float): Learning rate for the optimizer.
-        val_percent (float): Fraction of data used for validation.
-        save_checkpoint (bool): If True, save model checkpoints after each epoch.
-        amp (bool): If True, employ Automatic Mixed Precision (AMP).
-        weight_decay (float): Weight decay for optimizer regularization.
-        momentum (float): Momentum factor for optimizer.
-        gradient_clipping (float): Maximum norm for gradient clipping.
+    Fix consolidati rispetto alle versioni precedenti:
+      - grad_scaler ora condizionale su (device=='cuda' AND amp) invece di
+        essere hardcoded enabled=False — con AMP attivo ma senza grad
+        scaling, il forward gira in FP16 senza la protezione da under/overflow
+        che il GradScaler fornisce: causa plausibile degli spike di validation
+        loss (fino a 66+) osservati nei log precedenti.
+      - `model`/`unet` allineati: la funzione riceveva `model` ma il corpo
+        usava `unet` (variabile globale) — funzionava per coincidenza di
+        scope, ora è coerente sul parametro `unet`.
+      - `args.load`/`args.resume` non più letti da una globale: parametri
+        espliciti `load_path`/`resume`.
+      - Blocco di profiling isolato e opzionale (flag `profile`), NON dentro
+        il loop di training (dove causava un secondo backward sullo stesso
+        grafo e rompeva persistent_workers).
+      - `save_every` è un parametro, non più hardcoded.
     """
-
     n_train = len(train_loader.dataset)
     n_val = len(val_loader.dataset)
 
-    # Initialize WANDB experiment logging
+    use_cuda_amp = (device.type == "cuda") and amp
+    autocast_device = device.type if device.type != "mps" else "cpu"
+
     experiment = wandb.init(
         entity="shadow",
-        project='U-Net',
+        project="U-Net",
         name=run_name,
-        resume='allow',
+        resume="allow",
     )
-    experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             save_checkpoint=save_checkpoint, amp=amp, uncond_prob=uncond_prob,
-             timesteps=diffusion.T)
-    )
+    experiment.config.update(dict(
+        epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
+        save_checkpoint=save_checkpoint, amp=amp, uncond_prob=uncond_prob,
+        timesteps=diffusion.T,
+    ))
 
     logging.info(f'''Starting training:
             Run name:         {run_name}
@@ -148,45 +171,88 @@ def train_model(
             Validation size:   {n_val}
             Checkpoints:       {save_checkpoint}
             Device:            {device.type}
-            Mixed Precision:   {amp}
+            Mixed Precision:   {amp} (grad scaler attivo: {use_cuda_amp})
             Uncond prob:       {uncond_prob}
         ''')
 
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    '''optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
-    global_step = 0'''
-
-    # RMSprop era pensato per la Dice/CE della segmentazione; per DDPM lo standard è AdamW
     params = list(unet.parameters()) + list(text_encoder.parameters())
     optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
-                                                     patience=5)  # minimizziamo la loss, non massimizziamo Dice
-    grad_scaler = torch.amp.GradScaler(enabled=False)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
+    grad_scaler = torch.amp.GradScaler(enabled=use_cuda_amp)
     global_step = 0
 
-    # Load model checkpoint if specified
+    # --- Load model checkpoint if specified ---
     start_epoch = 1
-    if args.load:
-        checkpoint = torch.load(args.load, map_location=device)
+    if load_path:
+        checkpoint = torch.load(load_path, map_location=device)
         unet.load_state_dict(checkpoint['unet_state'])
         text_encoder.load_state_dict(checkpoint['text_encoder_state'])
+        logging.info(f"Checkpoint caricato, chiavi disponibili: {list(checkpoint.keys())}")
 
-        if args.resume:
-            optimizer.load_state_dict(checkpoint['optimizer_state'])
+        if resume:
+            if 'optimizer_state' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state'])
+            else:
+                logging.warning("Nessun optimizer_state nel checkpoint: optimizer riparte da zero nonostante --resume")
+            if 'scheduler_state' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state'])
+            else:
+                logging.warning("Nessun scheduler_state nel checkpoint: scheduler riparte senza memoria del plateau")
             start_epoch = checkpoint['epoch'] + 1
             logging.info(f'Resuming training from epoch {start_epoch}')
         else:
-            logging.info(f'Loaded weights only from {args.load} (fresh optimizer/epoch)')
+            logging.info(f'Loaded weights only from {load_path} (fresh optimizer/epoch)')
 
-    # 5. Begin training loop over epochs
+    # --- Profiling isolato, opzionale ---
+    if profile:
+        data_iter = iter(train_loader)
+        n_warmup, n_measure = 2, 5
+
+        for _ in range(n_warmup):
+            batch = next(data_iter)
+            images_dbg = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            input_ids_dbg = batch["input_ids"].to(device=device, dtype=torch.long)
+            cond_mask_dbg = torch.ones(images_dbg.shape[0], device=device)
+            text_hidden_dbg, _ = text_encoder(input_ids_dbg, cond_mask_dbg)
+            pad_mask_dbg = input_ids_dbg.eq(tokenizer.pad_id)
+            t_dbg = torch.randint(0, diffusion.T, (images_dbg.shape[0],), device=device).long()
+            loss_dbg = diffusion.training_loss(unet, images_dbg, t_dbg, text_hidden_dbg, pad_mask_dbg)
+            loss_dbg.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        times = {"data": [], "forward": [], "backward": [], "optim": []}
+        for _ in range(n_measure):
+            _, t_data = timed_step(lambda: next(data_iter), device)
+            batch = next(data_iter)
+
+            images_dbg = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            input_ids_dbg = batch["input_ids"].to(device=device, dtype=torch.long)
+            cond_mask_dbg = torch.ones(images_dbg.shape[0], device=device)
+            text_hidden_dbg, _ = text_encoder(input_ids_dbg, cond_mask_dbg)
+            pad_mask_dbg = input_ids_dbg.eq(tokenizer.pad_id)
+            t_dbg = torch.randint(0, diffusion.T, (images_dbg.shape[0],), device=device).long()
+
+            loss_dbg, t_forward = timed_step(diffusion.training_loss, device, unet, images_dbg, t_dbg, text_hidden_dbg, pad_mask_dbg)
+            _, t_backward = timed_step(loss_dbg.backward, device)
+            _, t_optim = timed_step(optimizer.step, device)
+            optimizer.zero_grad(set_to_none=True)
+
+            times["data"].append(t_data); times["forward"].append(t_forward)
+            times["backward"].append(t_backward); times["optim"].append(t_optim)
+
+        avg = {k: sum(v) / len(v) for k, v in times.items()}
+        logging.info(
+            f"[PROFILING] (media su {n_measure} step, dopo warmup) "
+            f"data: {avg['data']:.1f}ms | forward+loss: {avg['forward']:.1f}ms | "
+            f"backward: {avg['backward']:.1f}ms | optimizer: {avg['optim']:.1f}ms"
+        )
+
+    # --- Training loop ---
     for epoch in range(start_epoch, epochs + 1):
-        model.train()
+        unet.train()
         text_encoder.train()
-        epoch_loss = 0
+        epoch_loss = 0.0
 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
@@ -194,21 +260,25 @@ def train_model(
                 input_ids = batch['input_ids'].to(device=device, dtype=torch.long)
                 B = images.shape[0]
 
-                # dropout del conditioning: uncond_prob=1.0 -> baseline unconditional
                 cond_mask = (torch.rand(B, device=device) >= uncond_prob).float()
 
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                with torch.autocast(autocast_device, enabled=amp):
                     text_hidden, _ = text_encoder(input_ids, cond_mask)
                     text_pad_mask = input_ids.eq(tokenizer.pad_id)
                     t = torch.randint(0, diffusion.T, (B,), device=device).long()
                     loss = diffusion.training_loss(unet, images, t, text_hidden, text_pad_mask)
 
                 optimizer.zero_grad(set_to_none=True)
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+                if use_cuda_amp:
+                    grad_scaler.scale(loss).backward()
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params, gradient_clipping)
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(params, gradient_clipping)
+                    optimizer.step()
 
                 pbar.update(B)
                 global_step += 1
@@ -223,6 +293,7 @@ def train_model(
                         'epoch': epoch,
                     })
 
+            # --- fine epoca ---
             histograms = {}
             for tag, value in list(unet.named_parameters()) + list(text_encoder.named_parameters()):
                 tag = tag.replace('/', '.')
@@ -246,8 +317,6 @@ def train_model(
                     **histograms,
                 }
 
-                # sample "spia": stesso prompt e stesso seed ad ogni eval,
-                # così vedi visivamente il modello migliorare nel tempo
                 if sample_prompt_ids is not None:
                     unet.eval()
                     text_encoder.eval()
@@ -274,21 +343,30 @@ def train_model(
                     text_encoder.train()
 
                 experiment.log(log_dict)
-            except:
-                pass
+            except Exception as e:
+                logging.warning(f"Logging fallito: {e}")
 
-        # Save model checkpoint at the end of each epoch if enabled
-        if save_checkpoint and epoch % 2 == 0:
+        # --- checkpoint ---
+        if epoch % 2 == 0:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             torch.save({
                 'epoch': epoch,
                 'unet_state': unet.state_dict(),
                 'text_encoder_state': text_encoder.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
                 'tokenizer_vocab': tokenizer.token2id,
                 'uncond_prob': uncond_prob,
+                'args': {
+                    'image_size': images.shape[-1],
+                    'text_dim': text_encoder.dim,
+                    'base_ch': unet.base_ch,
+                    'timesteps': diffusion.T,
+                    'schedule': getattr(diffusion, 'schedule', 'cosine'),
+                },
             }, str(dir_checkpoint / f'checkpoint_{run_name}_epoch{epoch}.pth'))
             logging.info(f'Checkpoint {epoch} saved!')
+
 
 def get_args():
     """
@@ -297,18 +375,17 @@ def get_args():
     Returns:
         argparse.Namespace: Parsed command-line arguments.
     """
-
     p = argparse.ArgumentParser(description='Train the UNet on images and caption (optional)')
     p.add_argument("--images_dir", required=True, help="Images Directory")
     p.add_argument("--attribute_legend_path", required=True,
-                   help="csv 'cartoon_image_attributes_labels.csv': attribute,value,text_label")
+                    help="csv 'cartoon_image_attributes_labels.csv': attribute,value,text_label")
     p.add_argument("--image_attribute_path", required=True,
-                   help="csv 'cartoon_image_attributes.csv': per-image numeric attribute codes")
+                    help="csv 'cartoon_image_attributes.csv': per-image numeric attribute codes")
     p.add_argument("--split_file", required=True, help="JSON with train/val/test/ood_compositional id lists")
     p.add_argument("--output_dir", required=True, help="Output directory")
     p.add_argument("--run_name", required=True, help="A name for the run")
     p.add_argument('--load', '-f', type=str, default=False, help='Checkpoint Path')
-    p.add_argument('--resume', action='store_true', help='Resume optimizer/epoch (--load required)')
+    p.add_argument('--resume', action='store_true', help='Resume optimizer/scheduler/epoch (--load required)')
 
     p.add_argument("--image_size", type=int, default=32, help="Size of image (32x32 or 64x64)")
     p.add_argument("--max_caption_len", type=int, default=24)
@@ -322,27 +399,26 @@ def get_args():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--uncond_prob", type=float, default=0.1,
-                   help="Probability of dropping text conditioning per sample. "
-                        "Set to 1.0 for the unconditional baseline run.")
+                    help="Probability of dropping text conditioning per sample. "
+                         "Set to 1.0 for the unconditional baseline run.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--rebuild_tokenizer", action="store_true")
     p.add_argument("--amp", action='store_true', help="Only for Cuda")
     p.add_argument("--cache_img_dir", type=str, help="Path to Cache Images Directory")
+    p.add_argument("--profile", action='store_true', help="Misura data/forward/backward/optimizer una tantum prima del training")
 
     return p.parse_args()
 
+
 if __name__ == '__main__':
-    # Parse training configuration from command-line arguments
     args = get_args()
 
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     set_seed(args.seed)
-    device = torch.device('mps' if torch.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
-    # create a configuration file.json for training
     run_dir = Path(args.output_dir) / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.json", "w") as f:
@@ -351,25 +427,21 @@ if __name__ == '__main__':
     train_ids = load_split_ids(args.split_file, "train")
     val_ids = load_split_ids(args.split_file, "val")
 
-    '''train_ids = train_ids[:round(len(train_ids) / 10)]
-    val_ids = val_ids[:round(len(val_ids) / 10)]'''
-
     tokenizer = build_tokenizer(args, train_ids)
 
     train_ds = AvatarDataset(
         args.images_dir, args.attribute_legend_path, args.image_attribute_path, tokenizer,
-        split_ids=train_ids, image_size=args.image_size, cache_dir=args.cache_img_dir
+        split_ids=train_ids, image_size=args.image_size, cache_dir=args.cache_img_dir,
     )
     val_ds = AvatarDataset(
         args.images_dir, args.attribute_legend_path, args.image_attribute_path, tokenizer,
-        split_ids=val_ids, image_size=args.image_size, cache_dir=args.cache_img_dir
+        split_ids=val_ids, image_size=args.image_size, cache_dir=args.cache_img_dir,
     )
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, persistent_workers=True, drop_last=True, pin_memory=False,
     )
-
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, persistent_workers=True, drop_last=True, pin_memory=False,
@@ -380,8 +452,6 @@ if __name__ == '__main__':
         dim=args.text_dim, n_layers=args.text_layers, pad_id=tokenizer.pad_id,
     ).to(device)
 
-    # n_channels=3 for RGB images
-    # base_ch is the number of probabilities you want to get per pixel
     unet = UNet(n_channels=3, base_ch=args.base_ch).to(device)
 
     diffusion = GaussianDiffusion(timesteps=args.timesteps, schedule=args.schedule, device=device)
@@ -391,23 +461,27 @@ if __name__ == '__main__':
                  f'\t{unet.base_ch} output channels (classes)\n'
                  f'\t{"Bilinear" if unet.bilinear else "Transposed conv"} upscaling')
 
-    sample_text = "a boy with blue eye color, afro hair style"  # scegli un prompt rappresentativo del tuo dataset
+    sample_text = "a boy with blue eye color, afro hair style"
     sample_prompt_ids = torch.as_tensor([tokenizer.encode(sample_text)], dtype=torch.long)
-    
-    # Begin training
+
     train_model(
-        model=unet,
+        unet=unet,
+        text_encoder=text_encoder,
+        diffusion=diffusion,
+        tokenizer=tokenizer,
+        device=device,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        run_name=args.run_name,
+        dir_checkpoint=run_dir / "checkpoints",
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
-        device=device,
+        save_every=args.save_every,
         amp=args.amp,
-        train_loader = train_loader,
-        val_loader = val_loader,
-        diffusion=diffusion,
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        run_name=args.run_name,
+        uncond_prob=args.uncond_prob,
         sample_prompt_ids=sample_prompt_ids,
-        uncond_prob=args.uncond_prob
+        load_path=args.load if args.load else None,
+        resume=args.resume,
+        profile=args.profile,
     )
