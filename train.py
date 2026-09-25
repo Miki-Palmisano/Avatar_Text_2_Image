@@ -76,6 +76,16 @@ def build_tokenizer(args, train_ids):
     logging.info(f"Built tokenizer: vocab_size={tok.vocab_size} from {len(train_captions)} train captions")
     return tok
 
+def timed_step(fn, *args, **kwargs):
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = fn(*args, **kwargs)
+    end.record()
+    torch.cuda.synchronize()
+    return result, start.elapsed_time(end)  # millisecondi
+
 def train_model(
         train_loader,
         val_loader,
@@ -213,56 +223,59 @@ def train_model(
                         'epoch': epoch,
                     })
 
-                histograms = {}
-                for tag, value in list(unet.named_parameters()) + list(text_encoder.named_parameters()):
-                    tag = tag.replace('/', '.')
-                    if value.grad is None:
-                        continue
-                    if not (torch.isinf(value) | torch.isnan(value)).any():
-                        histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                    if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                        histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+            histograms = {}
+            for tag, value in list(unet.named_parameters()) + list(text_encoder.named_parameters()):
+                tag = tag.replace('/', '.')
+                if value.grad is None:
+                    continue
+                if not (torch.isinf(value) | torch.isnan(value)).any():
+                    histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
+                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                    histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-                val_loss = evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp)
-                scheduler.step(val_loss)
-                logging.info(f'Validation loss: {val_loss}')
+            val_loss = evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp)
+            scheduler.step(val_loss)
+            logging.info(f'Validation loss: {val_loss}')
 
-                try:
-                    log_dict = {
-                        'learning rate': optimizer.param_groups[0]['lr'],
-                        'validation loss': val_loss,
-                        'step': global_step,
-                        'epoch': epoch,
-                        **histograms,
-                    }
+            try:
+                log_dict = {
+                    'learning rate': optimizer.param_groups[0]['lr'],
+                    'validation loss': val_loss,
+                    'step': global_step,
+                    'epoch': epoch,
+                    **histograms,
+                }
 
-                    # sample "spia": stesso prompt e stesso seed ad ogni eval,
-                    # così vedi visivamente il modello migliorare nel tempo
-                    if sample_prompt_ids is not None:
-                        unet.eval()
-                        text_encoder.eval()
-                        with torch.no_grad():
-                            prompt_ids = sample_prompt_ids.to(device)
-                            cond_mask_eval = torch.ones(1, device=device)
-                            text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
-                            pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
-                            shape = (1, 3, images.shape[-2], images.shape[-1])
+                # sample "spia": stesso prompt e stesso seed ad ogni eval,
+                # così vedi visivamente il modello migliorare nel tempo
+                if sample_prompt_ids is not None:
+                    unet.eval()
+                    text_encoder.eval()
+                    with torch.no_grad():
+                        prompt_ids = sample_prompt_ids.to(device)
+                        # coerente con la distribuzione vista in training: se uncond_prob=1,
+                        # il modello ha sempre e solo visto cond_mask=0 (null) — valutarlo
+                        # con cond_mask=1 lo metterebbe fuori distribuzione
+                        cond_mask_eval = torch.zeros(1, device=device) if uncond_prob >= 1.0 else torch.ones(1, device=device)
+                        text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
+                        pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
+                        shape = (1, 3, images.shape[-2], images.shape[-1])
 
-                            sample = diffusion.sample(
-                                unet, shape, text_hidden_eval, pad_mask_eval,
-                                device=device, seed=global_step,
-                            )
+                        sample = diffusion.sample(
+                            unet, shape, text_hidden_eval, pad_mask_eval,
+                            device=device, seed=global_step,
+                        )
 
-                            from predict import tensor_to_image
-                            pil_img = tensor_to_image(sample[0].cpu())
-                            log_dict['sample'] = wandb.Image(pil_img)
+                        from predict import tensor_to_image
+                        pil_img = tensor_to_image(sample[0].cpu())
+                        log_dict['sample'] = wandb.Image(pil_img)
 
-                        unet.train()
-                        text_encoder.train()
+                    unet.train()
+                    text_encoder.train()
 
-                    experiment.log(log_dict)
-                except:
-                    pass
+                experiment.log(log_dict)
+            except:
+                pass
 
         # Save model checkpoint at the end of each epoch if enabled
         if save_checkpoint and epoch % 2 == 0:
@@ -312,10 +325,11 @@ def get_args():
                    help="Probability of dropping text conditioning per sample. "
                         "Set to 1.0 for the unconditional baseline run.")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--rebuild_tokenizer", action="store_true")
     p.add_argument("--amp", action='store_true', help="Only for Cuda")
+    p.add_argument("--cache_img_dir", type=str, help="Path to Cache Images Directory")
 
     return p.parse_args()
 
@@ -344,11 +358,11 @@ if __name__ == '__main__':
 
     train_ds = AvatarDataset(
         args.images_dir, args.attribute_legend_path, args.image_attribute_path, tokenizer,
-        split_ids=train_ids, image_size=args.image_size, cache_dir="cache_64"
+        split_ids=train_ids, image_size=args.image_size, cache_dir=args.cache_img_dir
     )
     val_ds = AvatarDataset(
         args.images_dir, args.attribute_legend_path, args.image_attribute_path, tokenizer,
-        split_ids=val_ids, image_size=args.image_size, cache_dir="cache_64"
+        split_ids=val_ids, image_size=args.image_size, cache_dir=args.cache_img_dir
     )
 
     train_loader = DataLoader(

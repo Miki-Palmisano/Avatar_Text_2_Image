@@ -1,6 +1,6 @@
 """
 
-python3 predict.py -m ./checkpoints/checkpoint_first_test_epoch2.pth -p "a boy with blue eye color, afro hair style" --seed 42 --guidance-scale 2.0 -v
+python3 predict.py -m ./checkpoints/checkpoint_first_test_epoch80.pth -p "a boy with blue eye color, afro hair style" --seed 42 --guidance-scale 2.0 -v
 
 """
 
@@ -135,16 +135,15 @@ if __name__ == '__main__':
             'oppure usa un checkpoint che lo contiene già (tokenizer_vocab).'
         )
 
-    image_size = train_args.get('image_size', 64)
+    image_size = train_args.get('image_size', 32)
     text_dim = train_args.get('text_dim', 96)
-    base_ch = train_args.get('base_ch', 64)
+    base_ch = train_args.get('base_ch', 32)
     timesteps = train_args.get('timesteps', 1000)
     schedule = train_args.get('schedule', 'cosine')
 
     unet = UNet(n_channels=3, base_ch=base_ch, text_dim=text_dim).to(device)
     unet.load_state_dict(checkpoint['unet_state'])
 
-    print(unet.inc.double_conv[1].running_mean[:5])
 
     text_encoder = TextEncoder(
         vocab_size=tokenizer.vocab_size, dim=text_dim, pad_id=tokenizer.pad_id,

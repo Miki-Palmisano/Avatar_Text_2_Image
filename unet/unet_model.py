@@ -28,7 +28,8 @@ class UNet(nn.Module):
         self.mid_attn = CrossAttention(c3 // factor, text_dim, n_heads)  # combacia con x3
 
         self.up1 = Up(c3, c2 // factor, time_dim, bilinear)  # concat: (c3//factor) + c2 = c3
-        self.up_attn = CrossAttention(c2 // factor, text_dim, n_heads)  # combacia con l'output di up1
+        #self.up_attn = CrossAttention(c2 // factor, text_dim, n_heads)  # combacia con l'output di up1
+        # ulteriore strato di crossattention, migliora il condizionamento del testo ma riduce del 20% le prestazioni
 
         self.up2 = Up(c2, c1, time_dim, bilinear)  # concat: (c2//factor) + c1 = c2
 
@@ -57,7 +58,7 @@ class UNet(nn.Module):
             x3 = checkpoint(self.mid_attn, x3, text_hidden, text_pad_mask, use_reentrant=False)
 
             x = checkpoint(self.up1, x3, x2, t_emb, use_reentrant=False)
-            x = checkpoint(self.up_attn, x, text_hidden, text_pad_mask, use_reentrant=False)
+            #x = checkpoint(self.up_attn, x, text_hidden, text_pad_mask, use_reentrant=False)
             x = checkpoint(self.up2, x, x1, t_emb, use_reentrant=False)
         else:
             x1 = self.inc(x, t_emb)
