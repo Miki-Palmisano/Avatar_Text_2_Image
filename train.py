@@ -33,6 +33,8 @@ from text_encoder import TextEncoder
 from unet import UNet
 from diffusion import GaussianDiffusion
 
+torch.backends.cudnn.benchmark = True
+
 import os
 os.environ["WANDB_MODE"] = "offline"
 
@@ -203,56 +205,11 @@ def train_model(
         else:
             logging.info(f'Loaded weights only from {load_path} (fresh optimizer/epoch)')
 
-    # --- Profiling isolato, opzionale ---
-    if profile:
-        data_iter = iter(train_loader)
-        n_warmup, n_measure = 2, 5
-
-        for _ in range(n_warmup):
-            batch = next(data_iter)
-            images_dbg = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-            input_ids_dbg = batch["input_ids"].to(device=device, dtype=torch.long)
-            cond_mask_dbg = torch.ones(images_dbg.shape[0], device=device)
-            text_hidden_dbg, _ = text_encoder(input_ids_dbg, cond_mask_dbg)
-            pad_mask_dbg = input_ids_dbg.eq(tokenizer.pad_id)
-            t_dbg = torch.randint(0, diffusion.T, (images_dbg.shape[0],), device=device).long()
-            loss_dbg = diffusion.training_loss(unet, images_dbg, t_dbg, text_hidden_dbg, pad_mask_dbg)
-            loss_dbg.backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
-        times = {"data": [], "forward": [], "backward": [], "optim": []}
-        for _ in range(n_measure):
-            _, t_data = timed_step(lambda: next(data_iter), device)
-            batch = next(data_iter)
-
-            images_dbg = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-            input_ids_dbg = batch["input_ids"].to(device=device, dtype=torch.long)
-            cond_mask_dbg = torch.ones(images_dbg.shape[0], device=device)
-            text_hidden_dbg, _ = text_encoder(input_ids_dbg, cond_mask_dbg)
-            pad_mask_dbg = input_ids_dbg.eq(tokenizer.pad_id)
-            t_dbg = torch.randint(0, diffusion.T, (images_dbg.shape[0],), device=device).long()
-
-            loss_dbg, t_forward = timed_step(diffusion.training_loss, device, unet, images_dbg, t_dbg, text_hidden_dbg, pad_mask_dbg)
-            _, t_backward = timed_step(loss_dbg.backward, device)
-            _, t_optim = timed_step(optimizer.step, device)
-            optimizer.zero_grad(set_to_none=True)
-
-            times["data"].append(t_data); times["forward"].append(t_forward)
-            times["backward"].append(t_backward); times["optim"].append(t_optim)
-
-        avg = {k: sum(v) / len(v) for k, v in times.items()}
-        logging.info(
-            f"[PROFILING] (media su {n_measure} step, dopo warmup) "
-            f"data: {avg['data']:.1f}ms | forward+loss: {avg['forward']:.1f}ms | "
-            f"backward: {avg['backward']:.1f}ms | optimizer: {avg['optim']:.1f}ms"
-        )
-
     # --- Training loop ---
     for epoch in range(start_epoch, epochs + 1):
         unet.train()
         text_encoder.train()
-        epoch_loss = 0.0
+        epoch_loss = torch.zeros(1, device=device)
 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
@@ -282,7 +239,7 @@ def train_model(
 
                 pbar.update(B)
                 global_step += 1
-                epoch_loss += loss.item()
+                epoch_loss += loss.detach()
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 if global_step % 10 == 0:
@@ -347,7 +304,7 @@ def train_model(
                 logging.warning(f"Logging fallito: {e}")
 
         # --- checkpoint ---
-        if epoch % 2 == 0:
+        if save_checkpoint and epoch % save_every == 0:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             torch.save({
                 'epoch': epoch,
@@ -404,10 +361,10 @@ def get_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--save_every", type=int, default=10)
+    p.add_argument("--save_checkpoint", action="store_true")
     p.add_argument("--rebuild_tokenizer", action="store_true")
     p.add_argument("--amp", action='store_true', help="Only for Cuda")
     p.add_argument("--cache_img_dir", type=str, help="Path to Cache Images Directory")
-    p.add_argument("--profile", action='store_true', help="Misura data/forward/backward/optimizer una tantum prima del training")
 
     return p.parse_args()
 
@@ -454,6 +411,9 @@ if __name__ == '__main__':
 
     unet = UNet(n_channels=3, base_ch=args.base_ch).to(device)
 
+    unet = torch.compile(unet)
+    text_encoder = torch.compile(text_encoder)
+
     diffusion = GaussianDiffusion(timesteps=args.timesteps, schedule=args.schedule, device=device)
 
     logging.info(f'Network:\n'
@@ -461,7 +421,7 @@ if __name__ == '__main__':
                  f'\t{unet.base_ch} output channels (classes)\n'
                  f'\t{"Bilinear" if unet.bilinear else "Transposed conv"} upscaling')
 
-    sample_text = "a boy with blue eye color, afro hair style"
+    sample_text = "a avatar with blue eye color and afro hair style"
     sample_prompt_ids = torch.as_tensor([tokenizer.encode(sample_text)], dtype=torch.long)
 
     train_model(
@@ -478,6 +438,7 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         learning_rate=args.lr,
         save_every=args.save_every,
+        save_checkpoint=args.save_checkpoint,
         amp=args.amp,
         uncond_prob=args.uncond_prob,
         sample_prompt_ids=sample_prompt_ids,
