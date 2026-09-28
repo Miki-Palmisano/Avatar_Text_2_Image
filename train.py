@@ -411,9 +411,6 @@ if __name__ == '__main__':
 
     unet = UNet(n_channels=3, base_ch=args.base_ch).to(device)
 
-    unet = torch.compile(unet)
-    text_encoder = torch.compile(text_encoder)
-
     diffusion = GaussianDiffusion(timesteps=args.timesteps, schedule=args.schedule, device=device)
 
     logging.info(f'Network:\n'
@@ -444,5 +441,4 @@ if __name__ == '__main__':
         sample_prompt_ids=sample_prompt_ids,
         load_path=args.load if args.load else None,
         resume=args.resume,
-        profile=args.profile,
     )
