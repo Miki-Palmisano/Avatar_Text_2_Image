@@ -5,3 +5,5 @@ pandas
 tqdm
 pillow
 wandb
+matplotlib
+torch-fidelity

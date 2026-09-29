@@ -84,25 +84,6 @@ def build_tokenizer(args, train_ids):
     return tok
 
 
-def timed_step(fn, device, *args, **kwargs):
-    """Misura il tempo di una singola operazione: torch.cuda.Event su CUDA
-    (accurato), fallback su time.time() per MPS/CPU (meno preciso ma non crasha)."""
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        result = fn(*args, **kwargs)
-        end.record()
-        torch.cuda.synchronize()
-        return result, start.elapsed_time(end)
-    else:
-        import time
-        t0 = time.time()
-        result = fn(*args, **kwargs)
-        return result, (time.time() - t0) * 1000  # ms
-
-
 def train_model(
         train_loader,
         val_loader,
