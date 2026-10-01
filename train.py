@@ -106,8 +106,7 @@ def train_model(
         sample_prompt_ids: torch.Tensor = None,  # (1, T) token ids per il sample "spia" ad ogni eval
         load_path: str = None,        # checkpoint da cui caricare i pesi (None = training da zero)
         resume: bool = False,         # se True, riprende anche optimizer/scheduler/epoca (richiede load_path)
-        profile: bool = False,        # se True, misura data/forward/backward/optimizer una tantum prima del training
-):
+    ):
     """
     Train U-Net + text encoder con l'obiettivo DDPM (MSE sul rumore predetto).
 
@@ -399,7 +398,7 @@ if __name__ == '__main__':
                  f'\t{unet.base_ch} output channels (classes)\n'
                  f'\t{"Bilinear" if unet.bilinear else "Transposed conv"} upscaling')
 
-    sample_text = "a avatar with blue eye color and afro hair style"
+    sample_text = "a avatar with blue eye color, afro hair and pink face color"
     sample_prompt_ids = torch.as_tensor([tokenizer.encode(sample_text)], dtype=torch.long)
 
     train_model(

@@ -4,11 +4,14 @@ su compositional-OOD, diversità tra seed per lo stesso prompt, parametri/
 tempo di sampling.
 
 Uso (un solo modello):
-    python evaluate.py \
-        --checkpoint runs/conditional/checkpoints/checkpoint_..._epoch100.pth \
-        --tokenizer runs/conditional/tokenizer.json \
-        --images_dir dataset --attribute_legend_path ... --image_attribute_path ... \
-        --split_file dataset/splits.json --output_dir eval_conditional \
+    python3 utils/fid_kid.py \
+        --checkpoint checkpoints/checkpoint_Conditional_Run_2_1_epoch100.pth \
+        --tokenizer runs/tokenizer_sixcaption.json \
+        --images_dir dataset/cartoonset100k \
+        --attribute_legend_path dataset/cartoon_image_attributes_labels.csv \
+        --image_attribute_path dataset/cartoon_image_attributes.csv \
+        --split_file dataset/splits.json \
+        --output_dir eval/conditional_sixcaption \
         --n_samples 200
 """
 from pathlib import Path
@@ -52,7 +55,7 @@ def load_model(checkpoint_path, tokenizer_path, device):
 
     diffusion = GaussianDiffusion(timesteps=train_args.get("timesteps", 1000),
                                     schedule=train_args.get("schedule", "cosine"), device=device)
-    image_size = train_args.get("image_size", 32)
+    image_size = train_args.get("image_size", 64)
 
     n_params = unet.num_params() + sum(p.numel() for p in text_encoder.parameters())
     return unet, text_encoder, diffusion, tokenizer, image_size, n_params
@@ -97,8 +100,7 @@ def compute_fid_kid(real_dir, gen_dir, device):
 @torch.no_grad()
 def diversity_across_seeds(unet, text_encoder, diffusion, tokenizer, prompt, device, image_size, n_seeds=8):
     """Genera n_seeds immagini per lo STESSO prompt, misura la diversità come
-    deviazione standard media pixel-per-pixel tra le generazioni (proxy semplice,
-    non richiede una rete di embedding aggiuntiva)."""
+    deviazione standard media pixel-per-pixel tra le generazioni."""
     imgs = []
     for seed in range(n_seeds):
         batch = generate_batch(unet, text_encoder, diffusion, tokenizer, [prompt], device, image_size, seed=seed)

@@ -8,3 +8,5 @@ checkpoints/
 gen_img/
 cache_64/
 eval_conditional
+
+eval/

@@ -1,14 +1,12 @@
 """
 
-python3 predict.py -m ./checkpoints/checkpoint_Conditional_Run_1_3_epoch99.pth -p "a avatar with normal chin length, normal eye angle, blue eye color, large eye eyebrow distance, normal eye lashes, large eye lid, upturned eye slant, tall narrow arched eyebrow shape, narrow eyebrow thickness, narrow eyebrow weight, long eyebrow width, fair light skin tone face color, rounded face shape, strap style facial hair, none glasses, blue glasses color, short side parted slicked back hair and black hair color" --guidance-scale 1.0 -v
+python3 predict.py -m ./checkpoints/checkpoint_Conditional_Run_2_1_epoch100.pth -p "a avatar with red eye color and white hair color" --guidance-scale 2.0 -v
 
 """
 
 import argparse
 import logging
-from pathlib import Path
 
-import numpy as np
 import torch
 from PIL import Image
 
