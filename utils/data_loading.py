@@ -127,7 +127,7 @@ def build_deterministic_caption(
         {"eye_color": "blue", "hair": "short"}
         -> "a avatar with blue eye color, short hair"
     """
-    #component_order = ["eye_color", "hair_color", "hair", "glasses", "face_color", "face_shape"]
+    component_order = ["eye_color", "hair_color", "hair", "glasses", "face_color", "face_shape"]
     attrs = dict(attributes)
     subject = attrs.pop(subject_component, "avatar")
 

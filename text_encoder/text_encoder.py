@@ -14,12 +14,12 @@ drop the condition (uncond_prob=1.0); for the conditional run you drop it
 with a small probability (e.g. 0.1) for classifier-free-guidance-style
 robustness, or never drop it if you don't want CFG.
 """
-import math
+
 import torch
 import torch.nn as nn
 
 
-class SinusoidalOrLearnedPositional(nn.Module):
+class PositionalEncoding(nn.Module):
     def __init__(self, max_len: int, dim: int):
         super().__init__()
         self.pos_emb = nn.Parameter(torch.randn(1, max_len, dim) * 0.02)
@@ -46,7 +46,7 @@ class TextEncoder(nn.Module):
         self.pad_id = pad_id
 
         self.token_emb = nn.Embedding(vocab_size, dim, padding_idx=pad_id)
-        self.pos_emb = SinusoidalOrLearnedPositional(max_len, dim)
+        self.pos_emb = PositionalEncoding(max_len, dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim,

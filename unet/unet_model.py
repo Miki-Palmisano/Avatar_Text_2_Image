@@ -4,8 +4,15 @@ from .unet_parts import *
 from torch.utils.checkpoint import checkpoint
 
 class UNet(nn.Module):
-    def __init__(self, n_channels=3, base_ch=64, text_dim=96, time_dim=256,
-                 bilinear=True, n_heads=4, use_checkpointing=False):
+    def __init__(self,
+                 n_channels=3,
+                 base_ch=64,
+                 text_dim=96,
+                 time_dim=256,
+                 bilinear=True,
+                 n_heads=4,
+                 use_checkpointing=False
+        ):
         super(UNet, self).__init__()
         self.n_channels = n_channels
         self.bilinear = bilinear
@@ -43,9 +50,9 @@ class UNet(nn.Module):
         """
                 x:              (B, 3, H, W) noisy image
                 t:              (B,) integer timesteps
-                text_hidden:    (B, T, text_dim) from your text encoder
+                text_hidden:    (B, T, text_dim) from text encoder
                 text_pad_mask:  (B, T) bool, True at PAD positions
-                """
+        """
         t_emb = self.time_mlp(timestep_embedding(t, self.time_dim))
 
         if self.use_ckpt and self.training:
