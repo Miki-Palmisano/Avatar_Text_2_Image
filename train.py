@@ -37,6 +37,7 @@ torch.backends.cudnn.benchmark = True
 
 import os
 os.environ["WANDB_MODE"] = "offline"
+#wandb.login(key="key")
 
 dir_img = Path('./dataset/cartoonset100k')
 
@@ -136,6 +137,7 @@ def train_model(
         entity="shadow",
         project="U-Net",
         name=run_name,
+        id=run_name,
         resume="allow",
     )
     experiment.config.update(dict(
