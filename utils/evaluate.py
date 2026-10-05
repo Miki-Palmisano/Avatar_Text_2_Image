@@ -5,7 +5,8 @@ def evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp):
     """Media della training_loss DDPM sul validation set (analogo a 'evaluate' della segmentazione,
     ma qui non c'è un Dice score: la metrica naturale durante il training è la stessa loss."""
     unet.eval()
-    text_encoder.eval()
+    if text_encoder is not None:
+        text_encoder.eval()
     total_loss = 0.0
     n_batches = 0
 
@@ -16,8 +17,12 @@ def evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp):
         cond_mask = torch.ones(B, device=device)  # in validation usiamo sempre il testo vero
 
         with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-            text_hidden, _ = text_encoder(input_ids, cond_mask)
-            text_pad_mask = input_ids.eq(tokenizer.pad_id)
+            if text_encoder is not None:
+                text_hidden, _ = text_encoder(input_ids, cond_mask)
+                text_pad_mask = input_ids.eq(tokenizer.pad_id)
+            else:
+                text_hidden, text_pad_mask = None, None
+
             t = torch.randint(0, diffusion.T, (B,), device=device).long()
             loss = diffusion.training_loss(unet, images, t, text_hidden, text_pad_mask)
 
@@ -25,5 +30,6 @@ def evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp):
         n_batches += 1
 
     unet.train()
-    text_encoder.train()
+    if text_encoder is not None:
+        text_encoder.train()
     return total_loss / max(n_batches, 1)

@@ -107,6 +107,7 @@ def train_model(
         sample_prompt_ids: torch.Tensor = None,  # (1, T) token ids per il sample "spia" ad ogni eval
         load_path: str = None,        # checkpoint da cui caricare i pesi (None = training da zero)
         resume: bool = False,         # se True, riprende anche optimizer/scheduler/epoca (richiede load_path)
+        no_text: bool = False
     ):
     """
     Train U-Net + text encoder con l'obiettivo DDPM (MSE sul rumore predetto).
@@ -127,6 +128,7 @@ def train_model(
         grafo e rompeva persistent_workers).
       - `save_every` è un parametro, non più hardcoded.
     """
+    use_text = not no_text
     n_train = len(train_loader.dataset)
     n_val = len(val_loader.dataset)
 
@@ -143,7 +145,7 @@ def train_model(
     experiment.config.update(dict(
         epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
         save_checkpoint=save_checkpoint, amp=amp, uncond_prob=uncond_prob,
-        timesteps=diffusion.T,
+        no_text = no_text, timesteps=diffusion.T,
     ))
 
     logging.info(f'''Starting training:
@@ -157,6 +159,7 @@ def train_model(
             Device:            {device.type}
             Mixed Precision:   {amp} (grad scaler attivo: {use_cuda_amp})
             Uncond prob:       {uncond_prob}
+            Percorso testuale: {"ATTIVO" if use_text else "ASSENTE (baseline no_text)"}
         ''')
 
     params = list(unet.parameters()) + list(text_encoder.parameters())
@@ -170,7 +173,8 @@ def train_model(
     if load_path:
         checkpoint = torch.load(load_path, map_location=device)
         unet.load_state_dict(checkpoint['unet_state'])
-        text_encoder.load_state_dict(checkpoint['text_encoder_state'])
+        if use_text:
+            text_encoder.load_state_dict(checkpoint['text_encoder_state'])
         logging.info(f"Checkpoint caricato, chiavi disponibili: {list(checkpoint.keys())}")
 
         if resume:
@@ -190,21 +194,26 @@ def train_model(
     # --- Training loop ---
     for epoch in range(start_epoch, epochs + 1):
         unet.train()
-        text_encoder.train()
+        if not no_text:
+            text_encoder.train()
         epoch_loss = torch.zeros(1, device=device)
 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images = batch["image"].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                input_ids = batch['input_ids'].to(device=device, dtype=torch.long)
-                B = images.shape[0]
 
-                cond_mask = (torch.rand(B, device=device) >= uncond_prob).float()
+                B = images.shape[0]
+                t = torch.randint(0, diffusion.T, (B,), device=device).long()
 
                 with torch.autocast(autocast_device, enabled=amp):
-                    text_hidden, _ = text_encoder(input_ids, cond_mask)
-                    text_pad_mask = input_ids.eq(tokenizer.pad_id)
-                    t = torch.randint(0, diffusion.T, (B,), device=device).long()
+                    if use_text:
+                        input_ids = batch['input_ids'].to(device=device, dtype=torch.long)
+                        cond_mask = (torch.rand(B, device=device) >= uncond_prob).float()
+                        text_hidden, _ = text_encoder(input_ids, cond_mask)
+                        text_pad_mask = input_ids.eq(tokenizer.pad_id)
+
+                    else:
+                        text_hidden, text_pad_mask = None, None
                     loss = diffusion.training_loss(unet, images, t, text_hidden, text_pad_mask)
 
                 optimizer.zero_grad(set_to_none=True)
@@ -212,11 +221,13 @@ def train_model(
                     grad_scaler.scale(loss).backward()
                     grad_scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(params, gradient_clipping)
+
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(params, gradient_clipping)
+
                     optimizer.step()
 
                 pbar.update(B)
@@ -233,8 +244,12 @@ def train_model(
                     })
 
             # --- fine epoca ---
+            named = list(unet.named_parameters())
+            if use_text:
+                named += list(text_encoder.named_parameters())
+
             histograms = {}
-            for tag, value in list(unet.named_parameters()) + list(text_encoder.named_parameters()):
+            for tag, value in named:
                 tag = tag.replace('/', '.')
                 if value.grad is None:
                     continue
@@ -258,15 +273,20 @@ def train_model(
 
                 if sample_prompt_ids is not None:
                     unet.eval()
-                    text_encoder.eval()
+                    if use_text:
+                        text_encoder.eval()
                     with torch.no_grad():
-                        prompt_ids = sample_prompt_ids.to(device)
-                        # coerente con la distribuzione vista in training: se uncond_prob=1,
-                        # il modello ha sempre e solo visto cond_mask=0 (null) — valutarlo
-                        # con cond_mask=1 lo metterebbe fuori distribuzione
-                        cond_mask_eval = torch.zeros(1, device=device) if uncond_prob >= 1.0 else torch.ones(1, device=device)
-                        text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
-                        pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
+                        if use_text:
+                            prompt_ids = sample_prompt_ids.to(device)
+                            # coerente con la distribuzione vista in training: se uncond_prob=1,
+                            # il modello ha sempre e solo visto cond_mask=0 (null) — valutarlo
+                            # con cond_mask=1 lo metterebbe fuori distribuzione
+                            cond_mask_eval = torch.zeros(1, device=device) if uncond_prob >= 1.0 else torch.ones(1, device=device)
+                            text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
+                            pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
+                        else:
+                            text_hidden_eval, pad_mask_eval = None, None
+
                         shape = (1, 3, images.shape[-2], images.shape[-1])
 
                         sample = diffusion.sample(
@@ -279,7 +299,8 @@ def train_model(
                         log_dict['sample'] = wandb.Image(pil_img)
 
                     unet.train()
-                    text_encoder.train()
+                    if use_text:
+                        text_encoder.train()
 
                 experiment.log(log_dict)
             except Exception as e:
@@ -288,10 +309,9 @@ def train_model(
         # --- checkpoint ---
         if save_checkpoint and epoch % save_every == 0:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            torch.save({
+            ckpt = {
                 'epoch': epoch,
                 'unet_state': unet.state_dict(),
-                'text_encoder_state': text_encoder.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict(),
                 'tokenizer_vocab': tokenizer.token2id,
@@ -302,8 +322,12 @@ def train_model(
                     'base_ch': unet.base_ch,
                     'timesteps': diffusion.T,
                     'schedule': getattr(diffusion, 'schedule', 'cosine'),
+                    'use_text': use_text
                 },
-            }, str(dir_checkpoint / f'checkpoint_{run_name}_epoch{epoch}.pth'))
+            }
+            if use_text:
+                ckpt['text_encoder_state'] = text_encoder.state_dict()
+            torch.save(ckpt, str(dir_checkpoint/f'checkpoint_{run_name}_epoch{epoch}.pth'))
             logging.info(f'Checkpoint {epoch} saved!')
 
 
@@ -347,6 +371,7 @@ def get_args():
     p.add_argument("--rebuild_tokenizer", action="store_true")
     p.add_argument("--amp", action='store_true', help="Only for Cuda")
     p.add_argument("--cache_img_dir", type=str, help="Path to Cache Images Directory")
+    p.add_argument("--no_text", action='store_true', help="Unconditioned Training")
 
     return p.parse_args()
 
@@ -386,12 +411,14 @@ if __name__ == '__main__':
         num_workers=args.num_workers, persistent_workers=True, drop_last=True, pin_memory=False,
     )
 
-    text_encoder = TextEncoder(
-        vocab_size=tokenizer.vocab_size, max_len=args.max_caption_len,
-        dim=args.text_dim, n_layers=args.text_layers, pad_id=tokenizer.pad_id,
-    ).to(device)
+    text_encoder = None
+    if not args.no_text:
+        text_encoder = TextEncoder(
+            vocab_size=tokenizer.vocab_size, max_len=args.max_caption_len,
+            dim=args.text_dim, n_layers=args.text_layers, pad_id=tokenizer.pad_id,
+        ).to(device)
 
-    unet = UNet(n_channels=3, base_ch=args.base_ch).to(device)
+    unet = UNet(n_channels=3, base_ch=args.base_ch, text_dim=args.text_dim, use_text=not args.no_text).to(device)
 
     diffusion = GaussianDiffusion(timesteps=args.timesteps, schedule=args.schedule, device=device)
 
@@ -423,4 +450,5 @@ if __name__ == '__main__':
         sample_prompt_ids=sample_prompt_ids,
         load_path=args.load if args.load else None,
         resume=args.resume,
+        no_text=args.no_text
     )

@@ -11,7 +11,8 @@ class UNet(nn.Module):
                  time_dim=256,
                  bilinear=True,
                  n_heads=4,
-                 use_checkpointing=False
+                 use_checkpointing=False,
+                 use_text=True
         ):
         super(UNet, self).__init__()
         self.n_channels = n_channels
@@ -19,6 +20,7 @@ class UNet(nn.Module):
         self.time_dim = time_dim
         self.base_ch = base_ch
         self.use_ckpt = use_checkpointing
+        self.use_text = use_text
 
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim), nn.SiLU(), nn.Linear(time_dim, time_dim)
@@ -32,10 +34,12 @@ class UNet(nn.Module):
         self.down1 = Down(c1, c2, time_dim)  # x2: c2 canali
         self.down2 = Down(c2, c3 // factor, time_dim)  # x3 (bottleneck): c3 // factor canali
 
-        self.mid_attn = CrossAttention(c3 // factor, text_dim, n_heads)  # combacia con x3
+        if use_text:
+            self.mid_attn = CrossAttention(c3 // factor, text_dim, n_heads)  # combacia con x3
+            self.up_attn = CrossAttention(c2 // factor, text_dim, n_heads)  # combacia con l'output di up1
 
         self.up1 = Up(c3, c2 // factor, time_dim, bilinear)  # concat: (c3//factor) + c2 = c3
-        self.up_attn = CrossAttention(c2 // factor, text_dim, n_heads)  # combacia con l'output di up1
+
         # ulteriore strato di crossattention, migliora il condizionamento del testo ma riduce del 20% le prestazioni
 
         self.up2 = Up(c2, c1, time_dim, bilinear)  # concat: (c2//factor) + c1 = c2
@@ -62,20 +66,26 @@ class UNet(nn.Module):
             x2 = checkpoint(self.down1, x1, t_emb, use_reentrant=False)
             x3 = checkpoint(self.down2, x2, t_emb, use_reentrant=False)
 
-            x3 = checkpoint(self.mid_attn, x3, text_hidden, text_pad_mask, use_reentrant=False)
+            if self.use_text:
+                x3 = checkpoint(self.mid_attn, x3, text_hidden, text_pad_mask, use_reentrant=False)
 
             x = checkpoint(self.up1, x3, x2, t_emb, use_reentrant=False)
-            x = checkpoint(self.up_attn, x, text_hidden, text_pad_mask, use_reentrant=False)
+
+            if self.use_text:
+                x = checkpoint(self.up_attn, x, text_hidden, text_pad_mask, use_reentrant=False)
             x = checkpoint(self.up2, x, x1, t_emb, use_reentrant=False)
         else:
             x1 = self.inc(x, t_emb)
             x2 = self.down1(x1, t_emb)
             x3 = self.down2(x2, t_emb)
 
-            x3 = self.mid_attn(x3, text_hidden, text_pad_mask)
+            if self.use_text:
+                x3 = self.mid_attn(x3, text_hidden, text_pad_mask)
 
             x = self.up1(x3, x2, t_emb)
-            x = self.up_attn(x, text_hidden, text_pad_mask)
+
+            if self.use_text:
+                x = self.up_attn(x, text_hidden, text_pad_mask)
             x = self.up2(x, x1, t_emb)
 
         logits = self.outc(x)
