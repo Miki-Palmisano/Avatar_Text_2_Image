@@ -34,6 +34,8 @@ class UNet(nn.Module):
         self.down1 = Down(c1, c2, time_dim)  # x2: c2 canali
         self.down2 = Down(c2, c3 // factor, time_dim)  # x3 (bottleneck): c3 // factor canali
 
+        self.self_attn = SelfAttention(c3 // factor, n_heads)  # stesso numero di canali di mid_attn
+
         if use_text:
             self.mid_attn = CrossAttention(c3 // factor, text_dim, n_heads)  # combacia con x3
             self.up_attn = CrossAttention(c2 // factor, text_dim, n_heads)  # combacia con l'output di up1
@@ -66,6 +68,8 @@ class UNet(nn.Module):
             x2 = checkpoint(self.down1, x1, t_emb, use_reentrant=False)
             x3 = checkpoint(self.down2, x2, t_emb, use_reentrant=False)
 
+            x3 = checkpoint(self.self_attn, x3)
+
             if self.use_text:
                 x3 = checkpoint(self.mid_attn, x3, text_hidden, text_pad_mask, use_reentrant=False)
 
@@ -78,6 +82,8 @@ class UNet(nn.Module):
             x1 = self.inc(x, t_emb)
             x2 = self.down1(x1, t_emb)
             x3 = self.down2(x2, t_emb)
+
+            x3 = self.self_attn(x3)
 
             if self.use_text:
                 x3 = self.mid_attn(x3, text_hidden, text_pad_mask)

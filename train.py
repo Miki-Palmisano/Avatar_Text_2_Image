@@ -162,7 +162,9 @@ def train_model(
             Percorso testuale: {"ATTIVO" if use_text else "ASSENTE (baseline no_text)"}
         ''')
 
-    params = list(unet.parameters()) + list(text_encoder.parameters())
+    params = list(unet.parameters())
+    if use_text:
+        params += list(text_encoder.parameters())
     optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
     grad_scaler = torch.amp.GradScaler(enabled=use_cuda_amp)
@@ -318,7 +320,7 @@ def train_model(
                 'uncond_prob': uncond_prob,
                 'args': {
                     'image_size': images.shape[-1],
-                    'text_dim': text_encoder.dim,
+                    'text_dim': getattr(text_encoder, 'dim', None),
                     'base_ch': unet.base_ch,
                     'timesteps': diffusion.T,
                     'schedule': getattr(diffusion, 'schedule', 'cosine'),

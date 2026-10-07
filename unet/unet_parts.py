@@ -82,6 +82,18 @@ class OutConv(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+class SelfAttention(nn.Module):
+    def __init__(self, ch, n_heads=4, groups=8):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(groups, ch), ch)
+        self.attn = nn.MultiheadAttention(ch, n_heads, batch_first=True)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x).reshape(B, C, H * W).permute(0, 2, 1)   # (B, HW, C)
+        out, _ = self.attn(h, h, h, need_weights=False)          # Q, K, V tutti dall'immagine
+        return x + out.permute(0, 2, 1).reshape(B, C, H, W)
+
 
 class CrossAttention(nn.Module):
     """Spatial features (query) attend to text hidden states (key/value).

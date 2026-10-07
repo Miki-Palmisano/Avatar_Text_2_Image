@@ -1,12 +1,13 @@
 """
 
-python3 predict.py -m ./checkpoints/checkpoint_Conditional_Run_2_1_epoch100.pth -p "a avatar with red eye color and white hair color" --guidance-scale 2.0 -v
+python3 predict.py -m ./checkpoints/checkpoint_UnConditional_Run_2_epoch100.pth -p --seed 42 --guidance-scale 2.0 -v
 
 """
 
 import argparse
 import logging
 import re
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -114,13 +115,13 @@ def tensor_to_image(img: torch.Tensor) -> Image.Image:
 def get_args():
     parser = argparse.ArgumentParser(description='Generate avatar images from a text prompt')
     parser.add_argument('--model', '-m', required=True, metavar='FILE',
-                         help='Path al checkpoint (.pt) salvato da train.py')
-    parser.add_argument('--prompt', '-p', required=True,
-                         help='Caption testuale, es: "a boy with blue eye color, short hair style"')
+                         help='Path al checkpoint salvato da train.py')
+    parser.add_argument('--prompt', '-p', default=None,
+                         help='Caption testuale (non serve per un checkpoint --no_text)')
     parser.add_argument('--output', '-o', default=None, metavar='OUTPUT',
-                         help='Nome file di output (default: derivato dal prompt)')
+                         help='Nome file di output (default: gen_img/<prompt>_OUT.png)')
     parser.add_argument('--tokenizer', default=None,
-                         help='Path al tokenizer.json; se omesso, prova a leggerlo dal checkpoint')
+                         help='Path al tokenizer.json; se omesso, usa il vocabolario salvato nel checkpoint')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--guidance-scale', type=float, default=1.0,
                          help='Classifier-free guidance scale (1.0 = nessuna guidance extra)')
@@ -189,7 +190,11 @@ if __name__ == '__main__':
     )
     result = tensor_to_image(image_tensor)
 
-    out_path = args.output or f"{args.prompt[:40].strip().replace(' ', '_')}_OUT.png"
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        stem = re.sub(r'[^a-zA-Z0-9]+', '_', (args.prompt or 'unconditional')[:40]).strip('_')
+        out_path = Path('gen_img') / f'{stem}_OUT.png'
     out_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(out_path)
     logging.info(f'Image saved to {out_path}')
