@@ -5,13 +5,13 @@ tempo di sampling.
 
 Uso (un solo modello):
     python3 utils/fid_kid.py \
-        --checkpoint checkpoints/checkpoint_Conditional_Run_2Attention_Self_epoch100.pth \
+        --checkpoint checkpoints/checkpoint_Conditional_Run_2Attention_Self_epoch110.pth \
         --tokenizer runs/tokenizer_sixcaption.json \
         --images_dir dataset/cartoonset100k \
         --attribute_legend_path dataset/cartoon_image_attributes_labels.csv \
         --image_attribute_path dataset/cartoon_image_attributes.csv \
         --split_file dataset/splits.json \
-        --output_dir eval/conditional_2attention_self \
+        --output_dir eval/conditional_2attention_self_2 \
         --n_samples 200
 
     python3 utils/fid_kid.py \
@@ -59,8 +59,6 @@ def load_model(checkpoint_path, tokenizer_path, device):
     use_text = train_args.get("use_text", True)
     if not use_text:
         mode = "none"
-    elif checkpoint.get("uncond_prob", 0.0) >= 1.0:
-        mode = "null"
     else:
         mode = "text"
 
@@ -81,7 +79,7 @@ def load_model(checkpoint_path, tokenizer_path, device):
 
     diffusion = GaussianDiffusion(timesteps=train_args.get("timesteps", 1000),
                                     schedule=train_args.get("schedule", "cosine"), device=device)
-    image_size = train_args.get("image_size", 32)
+    image_size = train_args.get("image_size", 64)
 
     # i parametri del text encoder si contano solo se il modello li ha davvero
     n_params = unet.num_params()
@@ -98,7 +96,7 @@ def generate_batch(unet, text_encoder, diffusion, tokenizer, captions, device, i
         text_hidden, pad_mask = None, None
     else:
         input_ids = torch.stack([torch.as_tensor(tokenizer.encode(c), dtype=torch.long) for c in captions]).to(device)
-        cond_mask = (torch.ones if mode == "text" else torch.zeros)(len(captions), device=device)
+        cond_mask = torch.ones(len(captions), device=device)
         text_hidden, _ = text_encoder(input_ids, cond_mask)
         pad_mask = input_ids.eq(tokenizer.pad_id)
     shape = (len(captions), 3, image_size, image_size)

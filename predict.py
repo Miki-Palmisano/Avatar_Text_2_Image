@@ -1,7 +1,11 @@
 """
+python3 predict.py -m "./checkpoints/checkpoint_Conditional_Run_2Attention_Self_epoch110.pth" \
+-p "a avatar with red eye color and white hair color" -v \
+--tokenizer "./runs/tokenizer_sixcaption.json" --use_ema --seed 30
 
-python3 predict.py -m ./checkpoints/checkpoint_UnConditional_Run_2_epoch100.pth -p --seed 42 --guidance-scale 2.0 -v
-
+17-26-30
+Per un checkpoint della baseline --no_text il prompt viene ignorato (non c'è percorso testuale):
+python3 predict.py -m ./checkpoints/checkpoint_uncond_baseline_epoch100.pth --seed 3 -v
 """
 
 import argparse
@@ -19,23 +23,15 @@ from tokenizer import Tokenizer
 
 
 @torch.no_grad()
-def sample_with_guidance(unet, diffusion, shape, text_hidden, text_pad_mask,
-                          null_hidden, null_pad_mask, device, guidance_scale=1.0,
-                          seed=None, clip_denoised=True):
+def sample_loop(unet, diffusion, shape, text_hidden, text_pad_mask, device, seed=None, clip_denoised=True):
+    """Reverse loop DDPM. Con text_hidden=None (baseline no_text) non c'è condizionamento."""
     if seed is not None:
         torch.manual_seed(seed)
     x = torch.randn(shape, device=device)
-    use_cfg = (guidance_scale != 1.0) and (text_hidden is not None)
 
     for t in reversed(range(diffusion.T)):
         batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
-
-        if not use_cfg:
-            pred_noise = unet(x, batch_t, text_hidden, text_pad_mask)
-        else:
-            eps_cond = unet(x, batch_t, text_hidden, text_pad_mask)
-            eps_uncond = unet(x, batch_t, null_hidden, null_pad_mask)
-            pred_noise = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        pred_noise = unet(x, batch_t, text_hidden, text_pad_mask)
 
         sqrt_ac_t = diffusion.sqrt_alphas_cumprod[t]
         sqrt_omac_t = diffusion.sqrt_one_minus_alphas_cumprod[t]
@@ -57,6 +53,7 @@ def sample_with_guidance(unet, diffusion, shape, text_hidden, text_pad_mask,
 
     return x.clamp(-1, 1)
 
+
 def warn_unknown_words(prompt, tokenizer):
     """Le parole fuori vocabolario diventano <unk> in silenzio: il modello non le "vede".
     Lo segnalo, perché è la causa più comune di 'il testo non influisce'."""
@@ -67,40 +64,25 @@ def warn_unknown_words(prompt, tokenizer):
 
 
 def generate_image(unet, text_encoder, diffusion, tokenizer, prompt, device,
-                    image_size, guidance_scale=1.0, seed=None, text_mode='text'):
+                    image_size, seed=None, text_mode="text"):
     """
     Genera una singola immagine (B=1).
     text_mode:
-      "text"   -> condizionata dal prompt (cond_mask=1)
-      "null"   -> modello allenato con uncond_prob=1.0: usa l'embedding null (cond_mask=0)
-      "none"   -> baseline --no_text: nessun percorso testuale
+      "text" -> condizionata dal prompt
+      "none" -> baseline --no_text: nessun percorso testuale
     """
     unet.eval()
-
-    if text_mode == 'none':
-        shape = (1, 3, image_size, image_size)
-        sample = sample_with_guidance(
-            unet, diffusion, shape, None, None, None, None,
-            device=device, guidance_scale=guidance_scale, seed=seed,
-        )
-        return sample[0].cpu()  # (3, H, W) in [-1, 1]
-
-    text_encoder.eval()
-
-    input_ids = torch.as_tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
-    pad_mask = input_ids.eq(tokenizer.pad_id)
-
-    cond_mask = torch.ones(1, device=device)          # 1 = usa il testo vero
-    uncond_mask = torch.zeros(1, device=device)        # 0 = forza l'embedding "null"
-
-    text_hidden, _ = text_encoder(input_ids, cond_mask)
-    null_hidden, _ = text_encoder(input_ids, uncond_mask)
-
     shape = (1, 3, image_size, image_size)
-    sample = sample_with_guidance(
-        unet, diffusion, shape, text_hidden, pad_mask, null_hidden, pad_mask,
-        device=device, guidance_scale=guidance_scale, seed=seed,
-    )
+
+    if text_mode == "none":
+        text_hidden, pad_mask = None, None
+    else:
+        text_encoder.eval()
+        input_ids = torch.as_tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
+        pad_mask = input_ids.eq(tokenizer.pad_id)
+        text_hidden, _ = text_encoder(input_ids, torch.ones(1, device=device))
+
+    sample = sample_loop(unet, diffusion, shape, text_hidden, pad_mask, device=device, seed=seed)
     return sample[0].cpu()  # (3, H, W) in [-1, 1]
 
 
@@ -123,35 +105,46 @@ def get_args():
     parser.add_argument('--tokenizer', default=None,
                          help='Path al tokenizer.json; se omesso, usa il vocabolario salvato nel checkpoint')
     parser.add_argument('--seed', type=int, default=None)
-    parser.add_argument('--guidance-scale', type=float, default=1.0,
-                         help='Classifier-free guidance scale (1.0 = nessuna guidance extra)')
+    parser.add_argument('--use_ema', action='store_true', help='Usa i pesi EMA salvati nel checkpoint (ema_state)')
     parser.add_argument('--viz', '-v', action='store_true', help='Mostra l\'immagine generata')
     return parser.parse_args()
+
 
 if __name__ == '__main__':
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-    device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
     logging.info(f'Using device {device}')
 
     logging.info(f'Loading checkpoint {args.model}')
     checkpoint = torch.load(args.model, map_location=device)
     train_args = checkpoint.get('args', {})  # iperparametri salvati da train.py
 
-    use_text = train_args.get('use_text', True)  # False per la baseline --no_text
-    uncond_trained = checkpoint.get('uncond_prob', 0.0) >= 1.0
-    text_mode = "none" if not use_text else ("null" if uncond_trained else "text")
+    use_text = train_args.get('use_text', True)          # False per la baseline --no_text
+    text_mode = "text" if use_text else "none"
     logging.info(f'Modalità del checkpoint: {text_mode}')
 
     image_size = train_args.get('image_size', 64)
-    text_dim = train_args.get('text_dim') or 96
+    text_dim = train_args.get('text_dim') or 96          # None nei checkpoint no_text
     base_ch = train_args.get('base_ch', 64)
     timesteps = train_args.get('timesteps', 1000)
     schedule = train_args.get('schedule', 'cosine')
 
     unet = UNet(n_channels=3, base_ch=base_ch, text_dim=text_dim, use_text=use_text).to(device)
-    unet.load_state_dict(checkpoint['unet_state'])
+    if args.use_ema:
+        if 'ema_state' not in checkpoint:
+            raise ValueError("Questo checkpoint non contiene 'ema_state': è stato allenato senza --ema_decay")
+        unet.load_state_dict(checkpoint['ema_state'])
+        logging.info('Pesi: EMA')
+    else:
+        unet.load_state_dict(checkpoint['unet_state'])
+        logging.info('Pesi: grezzi')
 
     tokenizer, text_encoder = None, None
     if use_text:
@@ -173,8 +166,6 @@ if __name__ == '__main__':
         ).to(device)
         text_encoder.load_state_dict(checkpoint['text_encoder_state'])
         warn_unknown_words(args.prompt, tokenizer)
-        if text_mode == "null":
-            logging.warning('Modello allenato con uncond_prob=1.0: il prompt viene ignorato.')
     elif args.prompt:
         logging.warning('Checkpoint --no_text: il prompt viene ignorato.')
 
@@ -185,7 +176,7 @@ if __name__ == '__main__':
 
     image_tensor = generate_image(
         unet, text_encoder, diffusion, tokenizer, args.prompt, device,
-        image_size=image_size, guidance_scale=args.guidance_scale, seed=args.seed,
+        image_size=image_size, seed=args.seed,
         text_mode=text_mode,
     )
     result = tensor_to_image(image_tensor)
@@ -195,7 +186,7 @@ if __name__ == '__main__':
     else:
         stem = re.sub(r'[^a-zA-Z0-9]+', '_', (args.prompt or 'unconditional')[:40]).strip('_')
         out_path = Path('gen_img') / f'{stem}_OUT.png'
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)   # prima: crashava se gen_img/ non esisteva
     result.save(out_path)
     logging.info(f'Image saved to {out_path}')
 

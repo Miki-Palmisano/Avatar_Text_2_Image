@@ -126,7 +126,6 @@ def train_model(
         amp: bool = False,
         weight_decay: float = 1e-4,
         gradient_clipping: float = 1.0,
-        uncond_prob: float = 0.1,     # 1.0 = baseline unconditional, es. 0.1 = modello conditioned
         sample_prompt_ids: torch.Tensor = None,  # (1, T) token ids per il sample "spia" ad ogni eval
         load_path: str = None,        # checkpoint da cui caricare i pesi (None = training da zero)
         resume: bool = False,         # se True, riprende anche optimizer/scheduler/epoca (richiede load_path)
@@ -152,7 +151,7 @@ def train_model(
     )
     experiment.config.update(dict(
         epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-        save_checkpoint=save_checkpoint, amp=amp, uncond_prob=uncond_prob,
+        save_checkpoint=save_checkpoint, amp=amp,
         no_text = no_text, timesteps=diffusion.T,
     ), allow_val_change=True)
 
@@ -166,7 +165,6 @@ def train_model(
             Checkpoints:       {save_checkpoint}
             Device:            {device.type}
             Mixed Precision:   {amp} (grad scaler attivo: {use_cuda_amp})
-            Uncond prob:       {uncond_prob}
             Percorso testuale: {"ATTIVO" if use_text else "ASSENTE (baseline no_text)"}
         ''')
 
@@ -174,7 +172,7 @@ def train_model(
     if use_text:
         params += list(text_encoder.parameters())
     optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5)
     grad_scaler = torch.amp.GradScaler(enabled=use_cuda_amp)
     global_step = 0
 
@@ -187,6 +185,7 @@ def train_model(
         unet.load_state_dict(checkpoint['unet_state'])
         if use_text:
             text_encoder.load_state_dict(checkpoint['text_encoder_state'])
+        start_epoch = checkpoint['epoch'] + 1
         logging.info(f"Checkpoint caricato, chiavi disponibili: {list(checkpoint.keys())}")
 
         if resume:
@@ -198,7 +197,6 @@ def train_model(
                 scheduler.load_state_dict(checkpoint['scheduler_state'])
             else:
                 logging.warning("Nessun scheduler_state nel checkpoint: scheduler riparte senza memoria del plateau")
-            start_epoch = checkpoint['epoch'] + 1
             logging.info(f'Resuming training from epoch {start_epoch}')
         else:
             logging.info(f'Loaded weights only from {load_path} (fresh optimizer/epoch)')
@@ -229,7 +227,7 @@ def train_model(
                 with torch.autocast(autocast_device, enabled=amp):
                     if use_text:
                         input_ids = batch['input_ids'].to(device=device, dtype=torch.long)
-                        cond_mask = (torch.rand(B, device=device) >= uncond_prob).float()
+                        cond_mask = torch.ones(B, device=device)
                         text_hidden, _ = text_encoder(input_ids, cond_mask)
                         text_pad_mask = input_ids.eq(tokenizer.pad_id)
 
@@ -314,7 +312,7 @@ def train_model(
                             # coerente con la distribuzione vista in training: se uncond_prob=1,
                             # il modello ha sempre e solo visto cond_mask=0 (null) — valutarlo
                             # con cond_mask=1 lo metterebbe fuori distribuzione
-                            cond_mask_eval = torch.zeros(1, device=device) if uncond_prob >= 1.0 else torch.ones(1, device=device)
+                            cond_mask_eval = torch.ones(1, device=device)
                             text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
                             pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)
                         else:
@@ -350,7 +348,6 @@ def train_model(
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict(),
                 'tokenizer_vocab': tokenizer.token2id,
-                'uncond_prob': uncond_prob,
                 'args': {
                     'image_size': images.shape[-1],
                     'text_dim': getattr(text_encoder, 'dim', None),
@@ -388,7 +385,7 @@ def get_args():
     p.add_argument('--resume', action='store_true', help='Resume optimizer/scheduler/epoch (--load required)')
 
     p.add_argument("--image_size", type=int, default=32, help="Size of image (32x32 or 64x64)")
-    p.add_argument("--max_caption_len", type=int, default=24)
+    p.add_argument("--max_caption_len", type=int, default=44)
     p.add_argument("--base_ch", type=int, default=64)
     p.add_argument("--text_dim", type=int, default=96)
     p.add_argument("--text_layers", type=int, default=3)
@@ -398,9 +395,6 @@ def get_args():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--uncond_prob", type=float, default=0.1,
-                    help="Probability of dropping text conditioning per sample. "
-                         "Set to 1.0 for the unconditional baseline run.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--save_every", type=int, default=10)
