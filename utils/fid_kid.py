@@ -5,13 +5,13 @@ tempo di sampling.
 
 Uso (un solo modello):
     python3 utils/fid_kid.py \
-        --checkpoint checkpoints/checkpoint_Conditional_Run_SixCaption_2Attention_epoch100.pth \
+        --checkpoint checkpoints/checkpoint_Conditional_Run_2Attention_Self_epoch100.pth \
         --tokenizer runs/tokenizer_sixcaption.json \
         --images_dir dataset/cartoonset100k \
         --attribute_legend_path dataset/cartoon_image_attributes_labels.csv \
         --image_attribute_path dataset/cartoon_image_attributes.csv \
         --split_file dataset/splits.json \
-        --output_dir eval/conditional_sixcaption_2attention \
+        --output_dir eval/conditional_2attention_self \
         --n_samples 200
 
     python3 utils/fid_kid.py \
