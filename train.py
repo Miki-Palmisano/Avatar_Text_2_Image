@@ -6,10 +6,8 @@ and handles model training, evaluation, and checkpoint saving.
 """
 
 import argparse
-import copy
 import json
 import logging
-import math
 import sys
 logging.basicConfig(
     level=logging.INFO,
@@ -86,29 +84,6 @@ def build_tokenizer(args, train_ids):
     logging.info(f"Built tokenizer: vocab_size={tok.vocab_size} from {len(train_captions)} train captions")
     return tok
 
-
-class EMA:
-    """Media mobile esponenziale dei pesi: shadow <- d*shadow + (1-d)*pesi.
-    Non influenza il training: serve solo a campionare con pesi meno rumorosi.
-    I buffer (running_mean/var della BatchNorm) sono già medie mobili: si copiano, non si mediano."""
-
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.n_updates = 0
-        self.shadow = copy.deepcopy(model).eval()
-        for p in self.shadow.parameters():
-            p.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self, model):
-        self.n_updates += 1
-        # warm-up: all'inizio segue i pesi da vicino, poi rallenta fino a `decay`
-        d = min(self.decay, (1 + self.n_updates) / (10 + self.n_updates))
-        for p_ema, p in zip(self.shadow.parameters(), model.parameters()):
-            p_ema.mul_(d).add_(p.detach(), alpha=1 - d)
-        for b_ema, b in zip(self.shadow.buffers(), model.buffers()):
-            b_ema.copy_(b)
-
 def train_model(
         train_loader,
         val_loader,
@@ -131,7 +106,6 @@ def train_model(
         load_path: str = None,        # checkpoint da cui caricare i pesi (None = training da zero)
         resume: bool = False,         # se True, riprende anche optimizer/scheduler/epoca (richiede load_path)
         no_text: bool = False,
-        ema_decay: float = 0.0,      #ema=0 disattivata
         seed: int = 21
     ):
     """
@@ -180,10 +154,8 @@ def train_model(
 
     # --- Load model checkpoint if specified ---
     start_epoch = 1
-    loaded_ema_state = None
     if load_path:
         checkpoint = torch.load(load_path, map_location=device)
-        loaded_ema_state = checkpoint.get('ema_state')
         unet.load_state_dict(checkpoint['unet_state'])
         if use_text:
             text_encoder.load_state_dict(checkpoint['text_encoder_state'])
@@ -203,14 +175,6 @@ def train_model(
         else:
             logging.info(f'Loaded weights only from {load_path} (fresh optimizer/epoch)')
 
-    # EMA creata DOPO il caricamento: parte dai pesi caricati (anche da un checkpoint senza EMA
-    ema = EMA(unet, ema_decay) if ema_decay > 0 else None
-    if ema is not None:
-        if resume and loaded_ema_state is not None:
-            ema.shadow.load_state_dict(loaded_ema_state)
-            logging.info("EMA ripresa dal checkpoint")
-        else:
-            logging.info(f"EMA inizializzata dai pesi correnti (decay={ema_decay})")
 
     # --- Training loop ---
     for epoch in range(start_epoch, epochs + 1):
@@ -251,9 +215,6 @@ def train_model(
 
                     optimizer.step()
 
-                if ema is not None:
-                    ema.update(unet)
-
                 pbar.update(B)
                 global_step += 1
                 epoch_loss += loss.detach()
@@ -286,29 +247,12 @@ def train_model(
             scheduler.step(val_loss)
             logging.info(f'Validation loss: {val_loss}')
 
-            # val loss anche sul modello EMA (è quello che campiona il sample spia); lo scheduler resta sui pesi grezzi
-            val_loss_ema = None
-            if ema is not None:
-                val_loss_ema = evaluate(ema.shadow, text_encoder, diffusion, val_loader, device, tokenizer, amp, seed=seed)
-                logging.info(f'Validation loss (EMA): {val_loss_ema}')
-
-            # diagnostica EMA: se i pesi EMA sono quasi identici a quelli grezzi, l'EMA non può cambiare i campioni
-            ema_dist = None
-            if ema is not None:
-                with torch.no_grad():
-                    num = sum(((p.detach() - pe) ** 2).sum().item() for p, pe in zip(unet.parameters(), ema.shadow.parameters()))
-                    den = sum((p.detach() ** 2).sum().item() for p in unet.parameters())
-                    ema_dist = math.sqrt(num / den)
-                logging.info(f'Distanza relativa pesi grezzi vs EMA: {ema_dist:.3e}')
-
             try:
                 log_dict = {
                     'learning rate': optimizer.param_groups[0]['lr'],
                     'validation loss': val_loss,
                     'step': global_step,
                     'epoch': epoch,
-                    **({'ema_rel_dist': ema_dist} if ema_dist is not None else {}),
-                    **({'validation loss ema': val_loss_ema} if val_loss_ema is not None else {}),
                     **histograms,
                 }
 
@@ -330,10 +274,8 @@ def train_model(
 
                         shape = (1, 3, images.shape[-2], images.shape[-1])
 
-                        sampler = ema.shadow if ema is not None else unet  # il sample spia usa i pesi EMA se attivi
-
                         sample = diffusion.sample(
-                            sampler, shape, text_hidden_eval, pad_mask_eval,
+                            unet, shape, text_hidden_eval, pad_mask_eval,
                             device=device, seed=global_step,
                         )
 
@@ -369,8 +311,6 @@ def train_model(
             }
             if use_text:
                 ckpt['text_encoder_state'] = text_encoder.state_dict()
-            if ema is not None:
-                ckpt['ema_state'] = ema.shadow.state_dict()
             torch.save(ckpt, str(dir_checkpoint/f'checkpoint_{run_name}_epoch{epoch}.pth'))
             logging.info(f'Checkpoint {epoch} saved!')
 
@@ -413,9 +353,6 @@ def get_args():
     p.add_argument("--amp", action='store_true', help="Only for Cuda")
     p.add_argument("--cache_img_dir", type=str, help="Path to Cache Images Directory")
     p.add_argument("--no_text", action='store_true', help="Unconditioned Training")
-
-    p.add_argument("--ema_decay", type=float, default=0.0,
-                   help="0 = EMA spenta. 0.999 per un training da zero, ~0.998 per un fine-tuning breve")
 
     return p.parse_args()
 
@@ -494,6 +431,5 @@ if __name__ == '__main__':
         load_path=args.load if args.load else None,
         resume=args.resume,
         no_text=args.no_text,
-        ema_decay=args.ema_decay,
         seed=args.seed
     )

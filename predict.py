@@ -9,7 +9,7 @@ SixCaption Self
 "a avatar with green eye color, pink face color, dark blonde hair color and love frame glasses" - 5 - 17
 
 Per un checkpoint della baseline --no_text il prompt viene ignorato (non c'è percorso testuale):
-python3 predict.py -m ./checkpoints/checkpoint_uncond_baseline_epoch100.pth --seed 3 -v
+python3 predict.py -m ./checkpoints/checkpoint_UnConditional_Run_Self_5_epoch100.pth --seed 3 -v
 """
 
 import argparse
@@ -109,7 +109,6 @@ def get_args():
     parser.add_argument('--tokenizer', default=None,
                          help='Path al tokenizer.json; se omesso, usa il vocabolario salvato nel checkpoint')
     parser.add_argument('--seed', type=int, default=None)
-    parser.add_argument('--use_ema', action='store_true', help='Usa i pesi EMA salvati nel checkpoint (ema_state)')
     parser.add_argument('--viz', '-v', action='store_true', help='Mostra l\'immagine generata')
     return parser.parse_args()
 
@@ -141,14 +140,8 @@ if __name__ == '__main__':
     schedule = train_args.get('schedule', 'cosine')
 
     unet = UNet(n_channels=3, base_ch=base_ch, text_dim=text_dim, use_text=use_text).to(device)
-    if args.use_ema:
-        if 'ema_state' not in checkpoint:
-            raise ValueError("Questo checkpoint non contiene 'ema_state': è stato allenato senza --ema_decay")
-        unet.load_state_dict(checkpoint['ema_state'])
-        logging.info('Pesi: EMA')
-    else:
-        unet.load_state_dict(checkpoint['unet_state'])
-        logging.info('Pesi: grezzi')
+    unet.load_state_dict(checkpoint['unet_state'])
+    logging.info('Pesi: raw')
 
     tokenizer, text_encoder = None, None
     if use_text:
