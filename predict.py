@@ -1,9 +1,13 @@
 """
-python3 predict.py -m "./checkpoints/checkpoint_Conditional_Run_2Attention_Self_epoch110.pth" \
+python3 predict.py -m "./checkpoints/checkpoint_Conditional_Run_2Attention_Self_3_epoch100.pth" \
 -p "a avatar with red eye color and white hair color" -v \
 --tokenizer "./runs/tokenizer_sixcaption.json" --use_ema --seed 30
 
-17-26-30
+SixCaption Self
+"a avatar with green eye color and pink face color" - 17 - 4
+"a avatar with green eye color, pink face color and dark blonde hair color" - 4 - 2
+"a avatar with green eye color, pink face color, dark blonde hair color and love frame glasses" - 5 - 17
+
 Per un checkpoint della baseline --no_text il prompt viene ignorato (non c'è percorso testuale):
 python3 predict.py -m ./checkpoints/checkpoint_uncond_baseline_epoch100.pth --seed 3 -v
 """

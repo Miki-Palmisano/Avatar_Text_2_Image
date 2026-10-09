@@ -33,7 +33,7 @@ class TextEncoder(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        max_len: int = 24,
+        max_len: int = 44,
         dim: int = 96,
         n_layers: int = 3,
         n_heads: int = 4,

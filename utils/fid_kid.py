@@ -5,13 +5,13 @@ tempo di sampling.
 
 Uso (un solo modello):
     python3 utils/fid_kid.py \
-        --checkpoint checkpoints/checkpoint_Conditional_Run_2Attention_Self_epoch110.pth \
+        --checkpoint checkpoints/checkpoint_Conditional_Run_2Attention_Self_3_epoch100.pth \
         --tokenizer runs/tokenizer_sixcaption.json \
         --images_dir dataset/cartoonset100k \
         --attribute_legend_path dataset/cartoon_image_attributes_labels.csv \
         --image_attribute_path dataset/cartoon_image_attributes.csv \
         --split_file dataset/splits.json \
-        --output_dir eval/conditional_2attention_self_2 \
+        --output_dir eval/conditional_2attention_self_3 \
         --n_samples 200
 
     python3 utils/fid_kid.py \
@@ -44,6 +44,12 @@ from tokenizer import Tokenizer
 from predict import tensor_to_image
 from data_loading import parse_attribute_legend, parse_image_attributes, build_deterministic_caption, load_data
 from torch_fidelity import calculate_metrics
+
+def text_encoder_kwargs(sd):
+    emb = sd["token_emb.weight"]
+    pos = sd["pos_emb.pos_emb"] if "pos_emb.pos_emb" in sd else sd["pos_emb.pe"]
+    n_layers = len({k.split(".")[2] for k in sd if k.startswith("encoder.layers.")})
+    return dict(vocab_size=emb.shape[0], dim=emb.shape[1], max_len=pos.shape[1], n_layers=n_layers)
 
 
 def load_model(checkpoint_path, tokenizer_path, device):
@@ -159,13 +165,14 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    logging.info(f"Device: {device}")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     unet, text_encoder, diffusion, tokenizer, image_size, n_params, mode = load_model(args.checkpoint, args.tokenizer, device)
     if mode != "none" and not args.tokenizer:
         raise ValueError("Questo modello usa il testo: passa --tokenizer")
-    logging.info(f"Modalità del modello: {mode}  (text=condizionato, null=testo spento, none=nessun percorso testuale)")
+    logging.info(f"Modalità del modello: {mode}")
     logging.info(f"Parametri totali: {n_params/1e6:.2f}M | image_size={image_size} | timesteps={diffusion.T}")
 
     legend = parse_attribute_legend(args.attribute_legend_path)

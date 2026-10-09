@@ -9,6 +9,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import sys
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +38,7 @@ from diffusion import GaussianDiffusion
 torch.backends.cudnn.benchmark = True
 
 import os
-#os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "offline"
 #wandb.login(key="key")
 
 dir_img = Path('./dataset/cartoonset100k')
@@ -130,7 +131,8 @@ def train_model(
         load_path: str = None,        # checkpoint da cui caricare i pesi (None = training da zero)
         resume: bool = False,         # se True, riprende anche optimizer/scheduler/epoca (richiede load_path)
         no_text: bool = False,
-        ema_decay: float = 0.0      #ema=0 disattivata
+        ema_decay: float = 0.0,      #ema=0 disattivata
+        seed: int = 21
     ):
     """
     Train U-Net + text encoder con l'obiettivo DDPM (MSE sul rumore predetto).
@@ -280,18 +282,24 @@ def train_model(
                 if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
                     histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-            val_loss = evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp)
+            val_loss = evaluate(unet, text_encoder, diffusion, val_loader, device, tokenizer, amp, seed=seed)
             scheduler.step(val_loss)
             logging.info(f'Validation loss: {val_loss}')
+
+            # val loss anche sul modello EMA (è quello che campiona il sample spia); lo scheduler resta sui pesi grezzi
+            val_loss_ema = None
+            if ema is not None:
+                val_loss_ema = evaluate(ema.shadow, text_encoder, diffusion, val_loader, device, tokenizer, amp, seed=seed)
+                logging.info(f'Validation loss (EMA): {val_loss_ema}')
 
             # diagnostica EMA: se i pesi EMA sono quasi identici a quelli grezzi, l'EMA non può cambiare i campioni
             ema_dist = None
             if ema is not None:
                 with torch.no_grad():
-                    num = sum(((p - pe) ** 2).sum() for p, pe in zip(unet.parameters(), ema.shadow.parameters()))
-                    den = sum((p ** 2).sum() for p in unet.parameters())
-                    ema_dist = (num / den).sqrt().item()
-                logging.info(f'Distanza relativa pesi grezzi vs EMA: {ema_dist:.5f}')
+                    num = sum(((p.detach() - pe) ** 2).sum().item() for p, pe in zip(unet.parameters(), ema.shadow.parameters()))
+                    den = sum((p.detach() ** 2).sum().item() for p in unet.parameters())
+                    ema_dist = math.sqrt(num / den)
+                logging.info(f'Distanza relativa pesi grezzi vs EMA: {ema_dist:.3e}')
 
             try:
                 log_dict = {
@@ -299,6 +307,8 @@ def train_model(
                     'validation loss': val_loss,
                     'step': global_step,
                     'epoch': epoch,
+                    **({'ema_rel_dist': ema_dist} if ema_dist is not None else {}),
+                    **({'validation loss ema': val_loss_ema} if val_loss_ema is not None else {}),
                     **histograms,
                 }
 
@@ -480,10 +490,10 @@ if __name__ == '__main__':
         save_every=args.save_every,
         save_checkpoint=args.save_checkpoint,
         amp=args.amp,
-        uncond_prob=args.uncond_prob,
         sample_prompt_ids=sample_prompt_ids,
         load_path=args.load if args.load else None,
         resume=args.resume,
         no_text=args.no_text,
-        ema_decay=args.ema_decay
+        ema_decay=args.ema_decay,
+        seed=args.seed
     )

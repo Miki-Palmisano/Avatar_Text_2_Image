@@ -19,7 +19,7 @@ def simple_word_tokenize(text: str) -> List[str]:
 
 
 class Tokenizer:
-    def __init__(self, max_len: int = 24):
+    def __init__(self, max_len: int = 44):
         self.max_len = max_len
         self.token2id: Dict[str, int] = {}
         self.id2token: Dict[int, str] = {}
