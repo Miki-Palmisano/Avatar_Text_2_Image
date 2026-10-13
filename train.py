@@ -263,9 +263,6 @@ def train_model(
                     with torch.no_grad():
                         if use_text:
                             prompt_ids = sample_prompt_ids.to(device)
-                            # coerente con la distribuzione vista in training: se uncond_prob=1,
-                            # il modello ha sempre e solo visto cond_mask=0 (null) — valutarlo
-                            # con cond_mask=1 lo metterebbe fuori distribuzione
                             cond_mask_eval = torch.ones(1, device=device)
                             text_hidden_eval, _ = text_encoder(prompt_ids, cond_mask_eval)
                             pad_mask_eval = prompt_ids.eq(tokenizer.pad_id)

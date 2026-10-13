@@ -125,17 +125,20 @@ def save_real_images(ids, id_to_path, images_dir, out_dir, image_size):
 
 def compute_fid_kid(real_dir, gen_dir, device):
     n = min(len(list(Path(real_dir).glob("*.png"))), len(list(Path(gen_dir).glob("*.png"))))
+    if n < 10:
+        logging.warning(f"Solo {n} immagini: FID/KID non sono statisticamente affidabili.")
+    kid_subset_size = max(2, min(100, n - 1))
     metrics = calculate_metrics(
         input1=str(real_dir), input2=str(gen_dir),
         fid=True, kid=True,
         cuda=(device.type == "cuda"),
         verbose=False,
-        kid_subset_size=max(2, min(100, n - 1)),
+        kid_subset_size=kid_subset_size,
     )
     return (metrics["frechet_inception_distance"],
             metrics["kernel_inception_distance_mean"],
-            metrics["kernel_inception_distance_std"])
-
+            metrics["kernel_inception_distance_std"],
+            kid_subset_size)
 
 class PeakMemory:
     """Picco di memoria durante un blocco di codice.
@@ -177,11 +180,6 @@ class PeakMemory:
             self._stop.set(); self._thread.join()
             self.peak_mb = max(self._samples) / 2**20
             self.kind = "mps polling 10ms (approssimato)"
-        else:
-            import resource
-            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            self.peak_mb = rss / 2**20 if platform.system() == "Darwin" else rss / 1024
-            self.kind = "cpu picco RSS del processo dall'avvio (sovrastima)"
         return False
 
 
@@ -197,13 +195,13 @@ def model_memory_mb(*modules):
 
 @torch.no_grad()
 def diversity_across_seeds(unet, text_encoder, diffusion, tokenizer, prompt, device, image_size,
-                           n_seeds=8, mode="text", amp=False):
-    """Genera n_seeds immagini per lo STESSO prompt; diversità = deviazione standard media per pixel."""
-    imgs = []
-    for seed in range(n_seeds):
-        batch = generate_batch(unet, text_encoder, diffusion, tokenizer, [prompt], device, image_size,
-                               seed=seed, mode=mode, amp=amp)
-        imgs.append(np.asarray(batch[0], dtype=np.float32) / 255.0)
+                           n_seeds=8, mode="text", amp=False, seed=0):
+    """Genera n_seeds immagini per lo STESSO prompt (un solo batch, rumore iniziale indipendente per ciascuna).
+    Diversità = deviazione standard, calcolata tra le immagini, per ogni pixel/canale, poi mediata (scala 0-1).
+    Misura quanto cambiano le immagini cambiando SOLO il seed; è semplice e sensibile a colore e sfondo."""
+    batch = generate_batch(unet, text_encoder, diffusion, tokenizer, [prompt] * n_seeds, device, image_size,
+                           seed=seed, mode=mode, amp=amp)
+    imgs = [np.asarray(im, dtype=np.float32) / 255.0 for im in batch]
     stacked = np.stack(imgs, axis=0)  # (n_seeds, H, W, 3)
     return stacked.std(axis=0).mean(), imgs
 
@@ -221,6 +219,8 @@ def main():
     p.add_argument("--gen_batch_size", type=int, default=32,
                    help="Immagini generate in parallelo: più alto = meno tempo per immagine. Va riportato col tempo")
     p.add_argument("--amp", action="store_true", help="Campiona in fp16 (solo CUDA). Stesso valore per TUTTI i modelli")
+    p.add_argument("--n_diversity_prompts", type=int, default=10, help="Quanti prompt (dal test set) per la diversità")
+    p.add_argument("--n_diversity_seeds", type=int, default=8, help="Immagini (seed) generate per ciascun prompt")
     p.add_argument("--diversity_prompts", nargs="*", default=None,
                    help="Prompt per la diversità tra seed; default: alcuni presi dal test set")
     p.add_argument("--seed", type=int, default=0)
@@ -283,33 +283,39 @@ def main():
         sampling_time_per_image = (time.time() - t0) / len(ids)
 
         logging.info(f"[{split_name}] Calcolo FID/KID...")
-        fid_score, kid_score, kid_std = compute_fid_kid(real_dir, gen_dir, device)
+        fid_score, kid_score, kid_std, kid_subset = compute_fid_kid(real_dir, gen_dir, device)
         results[split_name] = {
             "n_samples": len(ids),
             "fid": fid_score,
             "kid": kid_score,
             "kid_std": kid_std,
+            "kid_subset_size": kid_subset,
             "sampling_time_per_image_sec": sampling_time_per_image,
             "peak_memory_mb": mem.peak_mb,          # al batch gen_batch_size
         }
         logging.info(f"[{split_name}] FID={fid_score:.3f} | KID={kid_score:.5f} ± {kid_std:.5f} | "
                      f"{sampling_time_per_image:.2f}s/immagine | picco memoria {mem.peak_mb:.0f} MB")
 
-    # --- Diversità tra seed ---
+    # --- Diversità tra seed (stesso prompt, seed diversi) ---
     diversity_prompts = args.diversity_prompts
     if not diversity_prompts:
-        sample_ids = splits.get("test", [])[:3]
+        sample_ids = splits.get("test", [])[:args.n_diversity_prompts]
         diversity_prompts = [build_deterministic_caption(metadata[i]) for i in sample_ids]
     if mode != "text":
-        diversity_prompts = diversity_prompts[:1]   # senza testo il "prompt" non conta
+        diversity_prompts = diversity_prompts[:1]   # senza testo il "prompt" non esiste: una sola misura
 
     diversity_results = []
     for prompt in diversity_prompts:
         std, _ = diversity_across_seeds(unet, text_encoder, diffusion, tokenizer, prompt, device, image_size,
-                                        n_seeds=8, mode=mode, amp=args.amp)
+                                        n_seeds=args.n_diversity_seeds, mode=mode, amp=args.amp, seed=args.seed)
         diversity_results.append({"prompt": prompt, "pixel_std_across_seeds": float(std)})
-        logging.info(f"Diversità (std pixel su 8 seed) per '{prompt[:50]}...': {std:.4f}")
+        logging.info(f"Diversità (std pixel su {args.n_diversity_seeds} seed) per '{prompt[:50]}...': {std:.4f}")
+    vals = np.array([d["pixel_std_across_seeds"] for d in diversity_results])
     results["diversity_across_seeds"] = diversity_results
+    results["diversity_summary"] = {"mean": float(vals.mean()),
+                                    "std_across_prompts": float(vals.std(ddof=1)) if len(vals) > 1 else None,
+                                    "n_prompts": len(vals), "n_seeds": args.n_diversity_seeds}
+    logging.info(f"Diversità media: {vals.mean():.4f} su {len(vals)} prompt x {args.n_diversity_seeds} seed")
 
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
