@@ -151,9 +151,9 @@ def train_model(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5)
     grad_scaler = torch.amp.GradScaler(enabled=use_cuda_amp)
     global_step = 0
+    start_epoch = 1
 
     # --- Load model checkpoint if specified ---
-    start_epoch = 1
     if load_path:
         checkpoint = torch.load(load_path, map_location=device)
         unet.load_state_dict(checkpoint['unet_state'])
@@ -167,11 +167,20 @@ def train_model(
                 optimizer.load_state_dict(checkpoint['optimizer_state'])
             else:
                 logging.warning("Nessun optimizer_state nel checkpoint: optimizer riparte da zero nonostante --resume")
+
             if 'scheduler_state' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state'])
             else:
                 logging.warning("Nessun scheduler_state nel checkpoint: scheduler riparte senza memoria del plateau")
-            logging.info(f'Resuming training from epoch {start_epoch}')
+
+            if use_cuda_amp and 'grad_scaler_state' in checkpoint:
+                grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+            else:
+                logging.warning(
+                    "GradScaler non ripristinato (checkpoint vecchio o --amp spento): la scala riparte dal valore iniziale")
+            logging.info(
+                f"RESUME dall'epoca {start_epoch}: pesi, optimizer (lr {optimizer.param_groups[0]['lr']:.2e}), "
+                f"scheduler, global_step={global_step}")
         else:
             logging.info(f'Loaded weights only from {load_path} (fresh optimizer/epoch)')
 
@@ -331,6 +340,9 @@ def get_args():
     p.add_argument('--load', '-f', type=str, default=False, help='Checkpoint Path')
     p.add_argument('--resume', action='store_true', help='Resume optimizer/scheduler/epoch (--load required)')
 
+    p.add_argument("--attn", nargs="+", default=None, choices=["self", "mid", "up"],
+                   help="self = self-attention al bottleneck; mid = cross-attention al bottleneck; up = cross-attention dopo up1")
+
     p.add_argument("--image_size", type=int, default=32, help="Size of image (32x32 or 64x64)")
     p.add_argument("--max_caption_len", type=int, default=44)
     p.add_argument("--base_ch", type=int, default=64)
@@ -356,6 +368,11 @@ def get_args():
 
 if __name__ == '__main__':
     args = get_args()
+    if args.resume and not args.load:
+        raise SystemExit("--resume richiede --load <checkpoint>")
+
+    if args.attn is None:
+        args.attn = [] if args.no_text else ["mid", "self"]
 
     set_seed(args.seed)
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -396,7 +413,9 @@ if __name__ == '__main__':
             dim=args.text_dim, n_layers=args.text_layers, pad_id=tokenizer.pad_id,
         ).to(device)
 
-    unet = UNet(n_channels=3, base_ch=args.base_ch, text_dim=args.text_dim, use_text=not args.no_text).to(device)
+    unet = UNet(n_channels=3, base_ch=args.base_ch, text_dim=args.text_dim, use_text=not args.no_text, attn=args.attn).to(device)
+
+    logging.info(f"U-Net: attenzioni attive = {unet.attn} | parametri U-Net = {unet.num_params():,}")
 
     diffusion = GaussianDiffusion(timesteps=args.timesteps, schedule=args.schedule, device=device)
 

@@ -23,6 +23,9 @@ REGOLA PER IL CONFRONTO: tutti i modelli confrontati vanno valutati con gli STES
 """
 from pathlib import Path
 import sys
+
+from tqdm import tqdm
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import argparse
@@ -67,11 +70,8 @@ def load_model(checkpoint_path, tokenizer_path, device):
     if use_text and not tokenizer_path:
         raise ValueError("Questo modello usa il testo: passa --tokenizer")
 
-    text_dim = train_args.get("text_dim") or 96   # None nei checkpoint no_text
-
-    unet = UNet(n_channels=3, base_ch=train_args.get("base_ch", 64),
-                text_dim=text_dim, use_text=use_text).to(device)
-    unet.load_state_dict(checkpoint["unet_state"])
+    unet = UNet.from_checkpoint(checkpoint).to(device)  # architettura dal checkpoint
+    logging.info(f"U-Net: attenzioni = {unet.attn}")
     unet.eval()
 
     tokenizer, text_encoder = None, None
@@ -107,6 +107,7 @@ def generate_batch(unet, text_encoder, diffusion, tokenizer, captions, device, i
         cond_mask = torch.ones(len(captions), device=device)
         text_hidden, _ = text_encoder(input_ids, cond_mask)
         pad_mask = input_ids.eq(tokenizer.pad_id)
+
     shape = (len(captions), 3, image_size, image_size)
     # amp: stessa precisione del training (fp16, solo CUDA); lo stato x del campionamento resta in fp32
     with torch.autocast("cuda", enabled=(amp and device.type == "cuda")):
@@ -142,7 +143,7 @@ class PeakMemory:
     """Picco di memoria durante un blocco di codice.
     cuda: torch.cuda.max_memory_allocated() (picco reale, pesi + attivazioni)
     mps : lettura di current_allocated_memory ogni 10 ms (APPROSSIMATO, non esiste un contatore di picco)
-    cpu : picco RSS del processo dall'avvio (sovrastima)"""
+    """
     def __init__(self, device):
         self.device, self.peak_mb, self.kind = device, None, None
 
@@ -271,13 +272,16 @@ def main():
         logging.info(f"[{split_name}] Genero {len(ids)} immagini ({mode})...")
         t0 = time.time()
         with PeakMemory(device) as mem:
-            for i in range(0, len(ids), args.gen_batch_size):
-                batch_ids = ids[i:i + args.gen_batch_size]
-                captions = [build_deterministic_caption(metadata[j]) for j in batch_ids]
-                imgs = generate_batch(unet, text_encoder, diffusion, tokenizer, captions, device, image_size,
-                                      seed=args.seed + i, mode=mode, amp=args.amp)
-                for j, img in zip(batch_ids, imgs):
-                    img.save(gen_dir / f"{j}.png")
+            with tqdm(total=len(ids), unit='img') as pbar:
+                for i in range(0, len(ids), args.gen_batch_size):
+                    batch_ids = ids[i:i + args.gen_batch_size]
+                    captions = [build_deterministic_caption(metadata[j]) for j in batch_ids]
+                    imgs = generate_batch(unet, text_encoder, diffusion, tokenizer, captions, device, image_size,
+                                          seed=args.seed + i, mode=mode, amp=args.amp)
+                    for j, img in zip(batch_ids, imgs):
+                        img.save(gen_dir / f"{j}.png")
+
+                    pbar.update(len(batch_ids))
         sampling_time_per_image = (time.time() - t0) / len(ids)
 
         logging.info(f"[{split_name}] Calcolo FID/KID...")
@@ -308,6 +312,7 @@ def main():
                                         n_seeds=args.n_diversity_seeds, mode=mode, amp=args.amp, seed=args.seed)
         diversity_results.append({"prompt": prompt, "pixel_std_across_seeds": float(std)})
         logging.info(f"Diversità (std pixel su {args.n_diversity_seeds} seed) per '{prompt[:50]}...': {std:.4f}")
+
     vals = np.array([d["pixel_std_across_seeds"] for d in diversity_results])
     results["diversity_across_seeds"] = diversity_results
     results["diversity_summary"] = {"mean": float(vals.mean()),
