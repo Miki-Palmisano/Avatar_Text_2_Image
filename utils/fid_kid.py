@@ -125,8 +125,6 @@ def save_real_images(ids, id_to_path, images_dir, out_dir, image_size):
 
 def compute_fid_kid(real_dir, gen_dir, device):
     n = min(len(list(Path(real_dir).glob("*.png"))), len(list(Path(gen_dir).glob("*.png"))))
-    if n < 10:
-        logging.warning(f"Solo {n} immagini: FID/KID non sono statisticamente affidabili.")
     kid_subset_size = max(2, min(100, n - 1))
     metrics = calculate_metrics(
         input1=str(real_dir), input2=str(gen_dir),
